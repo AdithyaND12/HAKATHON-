@@ -1,57 +1,55 @@
+"""Constitution PDF RAG using a *dedicated* embedding model.
+
+Key fixes over the original:
+    * `LM_STUDIO_EMBEDDING_MODEL` is a separate env var — the chat model is
+      almost never a valid embedding model in LM Studio, so this was the #1
+      source of first-time-user failures.
+    * `_ensure_indexed` writes a `sha256` marker so re-indexing runs when the
+      PDF changes, and does not rely on Chroma's private `_collection` counter
+      as the sole signal.
+    * Import from `langchain_chroma` when available; fall back to the
+      deprecated `langchain_community.vectorstores.Chroma` so existing
+      environments do not break.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import logging
 from pathlib import Path
-import math
-import os
 
 import pymupdf
-from dotenv import load_dotenv
-from langchain_community.vectorstores import Chroma
 from langchain_core.documents import Document
 from langchain_openai import OpenAIEmbeddings
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
-load_dotenv()
+import config
 
-DEFAULT_LM_STUDIO_MODEL = "qwen2.5-coder-7b-instruct"
-DEFAULT_LM_STUDIO_BASE_URL = "http://localhost:1234/v1"
-DEFAULT_LM_STUDIO_API_KEY = "lm-studio"
-DEFAULT_HTTP_TIMEOUT_SECONDS = 10.0
-DEFAULT_PDF_PATH = Path(__file__).resolve().parent / "pdfs" / "c9fe9c9b6840524844316f74bb1c556c.pdf"
+log = logging.getLogger(__name__)
 
-
-def _environment_value(name: str, default: str = "") -> str:
-    value = os.getenv(name)
-    return value.strip() if value and value.strip() else default
+try:  # Prefer the new dedicated package.
+    from langchain_chroma import Chroma  # type: ignore
+except ImportError:  # pragma: no cover - environment-dependent import.
+    from langchain_community.vectorstores import Chroma  # type: ignore
 
 
-def _configured_path() -> Path:
-    configured_path = Path(
-        _environment_value("CONSTITUTION_PDF_PATH", str(DEFAULT_PDF_PATH))
-    ).expanduser()
-    if configured_path.is_absolute():
-        return configured_path
-    return Path(__file__).resolve().parent / configured_path
-
-
-def _configured_http_timeout() -> float:
-    configured_value = os.getenv("HTTP_TIMEOUT_SECONDS")
-    try:
-        timeout = float(configured_value) if configured_value else DEFAULT_HTTP_TIMEOUT_SECONDS
-    except (TypeError, ValueError):
-        return DEFAULT_HTTP_TIMEOUT_SECONDS
-    if not math.isfinite(timeout) or timeout <= 0:
-        return DEFAULT_HTTP_TIMEOUT_SECONDS
-    return timeout
-
-
-LM_STUDIO_MODEL = _environment_value("LM_STUDIO_MODEL", DEFAULT_LM_STUDIO_MODEL)
-LM_STUDIO_BASE_URL = _environment_value("LM_STUDIO_BASE_URL", DEFAULT_LM_STUDIO_BASE_URL)
-LM_STUDIO_API_KEY = _environment_value("LM_STUDIO_API_KEY", DEFAULT_LM_STUDIO_API_KEY)
-HTTP_TIMEOUT_SECONDS = _configured_http_timeout()
-PDF_PATH = _configured_path()
+# Constants preserved as module attributes so tests can monkeypatch them.
+LM_STUDIO_MODEL = config.LM_STUDIO_MODEL
+LM_STUDIO_EMBEDDING_MODEL = config.LM_STUDIO_EMBEDDING_MODEL
+LM_STUDIO_BASE_URL = config.LM_STUDIO_BASE_URL
+LM_STUDIO_API_KEY = config.LM_STUDIO_API_KEY
+HTTP_TIMEOUT_SECONDS = config.HTTP_TIMEOUT_SECONDS
+DEFAULT_PDF_PATH = config.DEFAULT_PDF_PATH
+PDF_PATH = config.CONSTITUTION_PDF_PATH
 PERSIST_DIRECTORY = Path(__file__).resolve().parent / "constitution_chroma_db"
 COLLECTION_NAME = "indian_constitution"
 DEFAULT_QUERY = "The Constitution of India"
 DEFAULT_TOP_K = 4
+
+
+def _configured_path() -> Path:
+    """Preserved for tests; returns the effective configured PDF path."""
+    return config.env_path("CONSTITUTION_PDF_PATH", config.DEFAULT_PDF_PATH)
 
 
 def _load_pdf_pages() -> list[Document]:
@@ -60,7 +58,6 @@ def _load_pdf_pages() -> list[Document]:
             f"Constitution PDF not found at {PDF_PATH}. "
             "Set CONSTITUTION_PDF_PATH to an existing PDF file."
         )
-
     pdf = pymupdf.open(PDF_PATH)
     pages: list[Document] = []
     try:
@@ -70,10 +67,7 @@ def _load_pdf_pages() -> list[Document]:
                 pages.append(
                     Document(
                         page_content=text,
-                        metadata={
-                            "source": str(PDF_PATH),
-                            "page": page_number,
-                        },
+                        metadata={"source": str(PDF_PATH), "page": page_number},
                     )
                 )
     finally:
@@ -82,19 +76,15 @@ def _load_pdf_pages() -> list[Document]:
 
 
 def _split_documents(documents: list[Document]) -> list[Document]:
-    splitter = RecursiveCharacterTextSplitter(
-        chunk_size=500,
-        chunk_overlap=50,
-    )
+    splitter = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=50)
     return splitter.split_documents(documents)
 
 
 def _get_embedding_model() -> OpenAIEmbeddings:
     return OpenAIEmbeddings(
-        model=LM_STUDIO_MODEL,
+        model=LM_STUDIO_EMBEDDING_MODEL,
         base_url=LM_STUDIO_BASE_URL,
         api_key=LM_STUDIO_API_KEY,
-        chunk_size=32,
         check_embedding_ctx_length=False,
     )
 
@@ -107,16 +97,46 @@ def _get_vectorstore() -> Chroma:
     )
 
 
+def _pdf_hash() -> str:
+    if not PDF_PATH.is_file():
+        return ""
+    hasher = hashlib.sha256()
+    with PDF_PATH.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(65536), b""):
+            hasher.update(chunk)
+    return hasher.hexdigest()
+
+
+def _marker_path() -> Path:
+    return PERSIST_DIRECTORY / ".indexed_sha256"
+
+
+def _needs_index(vectorstore: Chroma) -> bool:
+    """Return True when the store is empty or the PDF hash changed."""
+    try:
+        count = vectorstore._collection.count()  # noqa: SLF001 - Chroma has no public helper
+    except Exception:  # noqa: BLE001
+        count = 0
+    if count == 0:
+        return True
+    marker = _marker_path()
+    if not marker.is_file():
+        return True
+    return marker.read_text(encoding="utf-8").strip() != _pdf_hash()
+
+
 def _ensure_indexed(vectorstore: Chroma) -> None:
-    if vectorstore._collection.count() > 0:
+    if not _needs_index(vectorstore):
         return
 
     pages = _load_pdf_pages()
     chunks = _split_documents(pages)
     batch_size = 32
-
     for start in range(0, len(chunks), batch_size):
         vectorstore.add_documents(chunks[start : start + batch_size])
+
+    PERSIST_DIRECTORY.mkdir(parents=True, exist_ok=True)
+    _marker_path().write_text(_pdf_hash(), encoding="utf-8")
 
 
 def retrieve_constitution_chunks(query: str = DEFAULT_QUERY) -> str:
@@ -124,16 +144,12 @@ def retrieve_constitution_chunks(query: str = DEFAULT_QUERY) -> str:
     vectorstore = _get_vectorstore()
     _ensure_indexed(vectorstore)
     results = vectorstore.similarity_search(query, k=DEFAULT_TOP_K)
-
     parts: list[str] = []
     for index, document in enumerate(results, start=1):
         page_num = document.metadata.get("page", "Unknown")
         if isinstance(page_num, int):
             page_num = page_num + 1
         parts.append(
-            f"--- Result {index} ---\n"
-            f"Page: {page_num}\n"
-            f"{document.page_content.strip()}"
+            f"--- Result {index} ---\nPage: {page_num}\n{document.page_content.strip()}"
         )
-
     return "\n\n".join(parts)

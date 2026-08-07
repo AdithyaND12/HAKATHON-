@@ -1,51 +1,61 @@
 # HAKATHON-
 
-An interactive LangGraph chatbot powered by an OpenAI-compatible LM Studio server. It combines web search, calculations, time lookup, stock prices, and retrieval from the Constitution of India PDF. It can also repeat searches on a background schedule while the CLI remains available for new requests.
+An interactive LangGraph chatbot powered by an OpenAI-compatible LM Studio server.
+It combines web search, calculations, time lookup, stock prices, and retrieval from
+the Constitution of India PDF. It can also repeat searches on a robust background
+schedule while the CLI remains available for new requests.
+
+## What's new (scheduler v2)
+
+The scheduling engine was rewritten to fix the pain points of the original:
+
+- **Cancel / list / pause / resume** — every job has a stable ID (`/jobs`, `/cancel <id>`).
+- **Interleaved output fixed** — a global console lock serializes all output; per-job
+  run history is written to `.hakathon/history/<id>/run-NNN.json`.
+- **Schedules survive restart** — the job registry is snapshotted to
+  `.hakathon/jobs.json` and unfinished schedules resume automatically next time you
+  launch the CLI.
+- **Retries with backoff** — a transient DuckDuckGo rate limit or connection blip no
+  longer aborts the schedule; each run is retried with exponential backoff.
+- **Absolute times** — natural-language prompts like *"search python news at 3pm"*,
+  *"tomorrow 9am"*, or *"in 5 minutes"* are parsed and honored.
+- **Improved fallback planner** — recognises *hourly*, *daily*, *every day at X*,
+  *twice*, *thrice*, *in N minutes*.
+- **Separate embedding model** — `LM_STUDIO_EMBEDDING_MODEL` fixes the #1 cause of
+  Constitution RAG failing on first run (the chat model rarely supports embeddings).
 
 ## Features
 
 - Local chat and tool-calling through LM Studio.
-- Web search with DuckDuckGo when current information is needed.
+- Web search via DuckDuckGo (wrapped with retry + backoff).
 - Calculator and current-time tools.
-- Alpha Vantage stock-price lookup with configurable timeouts and clear API errors.
-- Constitution PDF retrieval using PyMuPDF, LangChain text splitting, OpenAI-compatible embeddings, and Chroma.
-- Natural-language scheduling such as “check this every 5 minutes for 3 times”.
-- Background scheduled jobs with cancellation and no unnecessary wait after the final run.
+- Alpha Vantage stock-price lookup with structured error taxonomy.
+- Constitution PDF retrieval using PyMuPDF, LangChain text splitting, an OpenAI-
+  compatible embedding model, and Chroma.
+- Natural-language scheduling: *"check tesla news every 10 minutes for 5 times"*,
+  *"search AI news at 3pm"*, *"monitor python news hourly"*.
+- Background scheduled jobs with cancellation, pause/resume, persistence, and
+  no unnecessary wait after the final run.
 
 ## Requirements
 
 - Python 3.10 or newer.
 - [LM Studio](https://lmstudio.ai/) running an OpenAI-compatible local server.
-- A model available in LM Studio. The configured model is used for chat and embeddings.
+- A chat model **and** a separate embedding model available in LM Studio.
 - An Alpha Vantage API key if stock-price lookups are required.
 
 ## Installation
 
-Create and activate a virtual environment, then install the dependencies:
-
 ```bash
 python3 -m venv .venv
-source .venv/bin/activate
+source .venv/bin/activate    # Windows: .venv\Scripts\activate
 pip install \
-  arrow \
-  chromadb \
-  duckduckgo-search \
-  langchain-community \
-  langchain-core \
-  langchain-openai \
-  langchain-text-splitters \
-  langgraph \
-  pydantic \
-  pymupdf \
-  python-dotenv \
-  requests
+  arrow chromadb ddgs langchain-community langchain-chroma langchain-core \
+  langchain-openai langchain-text-splitters langgraph pydantic pymupdf \
+  python-dotenv requests pytest
 ```
 
-On Windows, activate the environment with `.venv\Scripts\activate` instead.
-
 ## Configuration
-
-Copy the example configuration and edit it as needed:
 
 ```bash
 cp .env.example .env
@@ -53,62 +63,110 @@ cp .env.example .env
 
 | Variable | Required | Default | Description |
 | --- | --- | --- | --- |
-| `LM_STUDIO_MODEL` | Yes | `qwen2.5-coder-7b-instruct` | Model served by LM Studio. |
+| `LM_STUDIO_MODEL` | Yes | `qwen2.5-coder-7b-instruct` | Chat model served by LM Studio. |
+| `LM_STUDIO_EMBEDDING_MODEL` | For RAG | `nomic-embed-text-v1.5` | Embedding model (must be a real embedding model, not a chat model). |
 | `LM_STUDIO_BASE_URL` | Yes | `http://localhost:1234/v1` | OpenAI-compatible LM Studio endpoint. |
 | `LM_STUDIO_API_KEY` | No | `lm-studio` | Key accepted by the local server. |
-| `ALPHAVANTAGE_API_KEY` | For stock prices | — | Alpha Vantage API key. |
-| `CONSTITUTION_PDF_PATH` | No | `pdfs/c9fe9c9b6840524844316f74bb1c556c.pdf` | Constitution PDF path, relative to the project directory or an absolute path. |
+| `ALPHAVANTAGE_API_KEY` | For stocks | — | Alpha Vantage API key. |
+| `CONSTITUTION_PDF_PATH` | No | `pdfs/c9fe9c9b6840524844316f74bb1c556c.pdf` | PDF path (relative or absolute). |
 | `HTTP_TIMEOUT_SECONDS` | No | `10` | Timeout for stock API requests. |
+| `WAIT_MAX_SECONDS` | No | `3600` | Upper bound for a single `wait` / interval. |
+| `MAX_AUTO_RUNS` | No | `20` | Cap on the number of runs the planner can schedule. |
+| `HAKATHON_DATA_DIR` | No | `.hakathon` | Where job registry + run history live. |
+| `DUCKDUCKGO_REGION` | No | `us-en` | DuckDuckGo region parameter. |
+| `SEARCH_MAX_RETRIES` | No | `3` | Retries for a single web_search invocation. |
+| `SEARCH_RETRY_BACKOFF_SECONDS` | No | `2.0` | Base backoff (doubles each retry). |
 
 The local `.env` file is ignored by Git. Never commit real API keys.
 
 ## Running the chatbot
 
-Start LM Studio’s local server with the configured model loaded, then run:
+Start LM Studio's local server with the configured models loaded, then:
 
 ```bash
 python app.py
 ```
 
-Enter a normal question at the `You:` prompt. Examples:
+### Slash commands
 
-```text
-What are the latest technology headlines?
-Calculate 27 times 14.
-What does the Constitution say about freedom of speech?
-What is the current price of AAPL?
-Check the latest Python news every 1 minute for 3 times.
+```
+/help                Show help
+/jobs                List every job registered in this session
+/cancel <id>         Cancel a running job
+/pause <id>          Pause a job (finishes the current run, then waits)
+/resume <id>         Resume a paused job
+/logs <id>           Show the last recorded run for a job
+/clear               Remove finished / cancelled / failed jobs from the list
+exit | quit | q      Leave the CLI (running schedules are stopped)
 ```
 
-Type `exit`, `quit`, or `q` to leave. Scheduled searches start in a background worker, so the CLI can accept another request immediately. Active schedules are asked to stop when the CLI exits.
+### Example prompts
+
+```
+You: What are the latest technology headlines?
+You: Calculate 27 times 14.
+You: What does the Constitution say about freedom of speech?
+You: What is the current price of AAPL?
+You: Check the latest Python news every 1 minute for 3 times.
+You: Monitor tesla stock hourly for 5 times.
+You: Search AI news tomorrow at 9am.
+You: Search python releases at 3pm.
+You: /jobs
+You: /cancel a1b2c3d4
+```
+
+## Persistence
+
+- `.hakathon/jobs.json` — atomic snapshot of every registered job. Unfinished
+  jobs are automatically resumed on the next `python app.py`.
+- `.hakathon/history/<job-id>/run-NNN.json` — the assistant output for each run,
+  timestamped.
 
 ## Constitution retrieval
 
-The first Constitution query indexes the configured PDF into the local `constitution_chroma_db/` directory. That generated database is ignored by Git. If the PDF is moved, set `CONSTITUTION_PDF_PATH` before starting the application; the program reports a clear error when the configured file does not exist.
+The first Constitution query indexes the configured PDF into the local
+`constitution_chroma_db/` directory. A `sha256` marker is written so re-indexing
+runs automatically whenever the PDF changes. `LM_STUDIO_EMBEDDING_MODEL` must be a
+real embedding model (e.g., `nomic-embed-text-v1.5`, `bge-small-en-v1.5`).
 
 ## Tests
-
-Run the test suite from the project directory:
 
 ```bash
 pytest -q
 ```
 
-The tests mock network and language-model calls, so they do not require a running LM Studio server or a live Alpha Vantage key.
+Tests mock every network + LLM call, so no LM Studio or Alpha Vantage key is needed.
+The suite covers: config parsing, stock error taxonomy, RAG configuration, planner
+regex fallback (including absolute times), and the full scheduler (retries,
+persistence, resume, pause, cancel, no-wait-after-final-run).
 
 ## Project structure
 
-```text
-app.py                         CLI, LangGraph workflow, tools, and scheduler
-ragtool.py                     Constitution PDF indexing and retrieval
-pdfs/                          Default Constitution PDF
-tests/                         Configuration, HTTP, PDF, and scheduler tests
-.env.example                   Safe configuration template
+```
+app.py                CLI entry point + LangGraph wiring + tools
+config.py             Centralised env parsing
+planner.py            Search + schedule planner (LLM + regex fallback + absolute time)
+scheduler.py          Job registry, persistence, retries, pause/resume
+tools_search.py       DuckDuckGo tool with retry / backoff
+ragtool.py            Constitution PDF indexing + retrieval
+tests/                pytest suite
+pdfs/                 Default Constitution PDF
+.hakathon/            Runtime data (jobs.json, per-job history) — git-ignored
+constitution_chroma_db/  Vector store — git-ignored
 ```
 
 ## Troubleshooting
 
-- **LM Studio connection error:** confirm the server is running and `LM_STUDIO_BASE_URL` matches its endpoint.
-- **Embedding error:** ensure the configured LM Studio model supports embeddings and is loaded by the server.
-- **Stock lookup unavailable:** set `ALPHAVANTAGE_API_KEY` in `.env`; the rest of the chatbot remains usable without it.
-- **PDF not found:** verify `CONSTITUTION_PDF_PATH` and use a path relative to the project directory or an absolute path.
+- **LM Studio connection error**: confirm the server is running and
+  `LM_STUDIO_BASE_URL` matches its endpoint.
+- **Constitution RAG errors like "not a valid embedding model"**: set
+  `LM_STUDIO_EMBEDDING_MODEL` to an actual embedding model loaded in LM Studio.
+- **Stock lookup unavailable**: set `ALPHAVANTAGE_API_KEY` in `.env`; the rest of
+  the chatbot remains usable without it.
+- **A schedule seems stuck**: run `/jobs` to see its state (`pending`, `running`,
+  `paused`, `completed`, `failed`), then `/cancel <id>` if needed. Check
+  `.hakathon/history/<id>/` for per-run output.
+
+## License
+
+MIT
