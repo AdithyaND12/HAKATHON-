@@ -1,0 +1,24 @@
+.env
+.env.*
+!.env.example
+.venv/
+__pycache__/
+.pytest_cache/
+.DS_Store
+constitution_chroma_db/
+tempCodeRunnerFile.python
+
+# Runtime data from the improved scheduler
+.hakathon/
+*.env
+credentials.json
+*.pem
+*.key
+.credentials
+
+# Emergent platform tracking (not part of the project)
+.emergent/
+.ruff_cache/
+memory/
+test_reports/
+
