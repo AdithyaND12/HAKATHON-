@@ -21,7 +21,26 @@ from pathlib import Path
 
 import streamlit as st
 from langchain_core.messages import HumanMessage, SystemMessage
-from streamlit_autorefresh import st_autorefresh
+
+try:
+    from streamlit_autorefresh import st_autorefresh
+except ImportError:  # pragma: no cover - only hit when the optional dep is missing
+    def st_autorefresh(**kwargs):  # type: ignore[no-redef]
+        """Fallback stub used when `streamlit-autorefresh` is not installed.
+
+        The app still works — scheduled runs won't appear until the user types
+        or clicks something. Fix by running: `pip install streamlit-autorefresh`.
+        """
+        st.session_state.setdefault("_autorefresh_missing_warned", False)
+        if not st.session_state["_autorefresh_missing_warned"]:
+            st.warning(
+                "`streamlit-autorefresh` is not installed. Scheduled runs will "
+                "only appear after your next interaction. Install it with "
+                "`pip install streamlit-autorefresh` for automatic updates.",
+                icon="⚠️",
+            )
+            st.session_state["_autorefresh_missing_warned"] = True
+        return 0
 
 # Reuse everything the CLI used.
 import config

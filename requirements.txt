@@ -1,0 +1,21 @@
+# Runtime dependencies for HAKATHON- (LangGraph chatbot + Streamlit UI).
+# Pin loosely — the code targets recent versions of each library.
+
+arrow
+chromadb
+ddgs
+langchain-community
+langchain-chroma
+langchain-core
+langchain-openai
+langchain-text-splitters
+langgraph
+pydantic
+pymupdf
+python-dotenv
+requests
+streamlit
+streamlit-autorefresh
+
+# Test-only
+pytest

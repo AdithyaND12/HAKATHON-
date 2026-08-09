@@ -49,10 +49,19 @@ The scheduling engine was rewritten to fix the pain points of the original:
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate    # Windows: .venv\Scripts\activate
+pip install -r requirements.txt
+```
+
+The `requirements.txt` includes everything, including the new
+`streamlit-autorefresh` dependency the UI uses for background polling.
+
+If you'd rather install manually:
+
+```bash
 pip install \
   arrow chromadb ddgs langchain-community langchain-chroma langchain-core \
   langchain-openai langchain-text-splitters langgraph pydantic pymupdf \
-  python-dotenv requests pytest streamlit
+  python-dotenv requests pytest streamlit streamlit-autorefresh
 ```
 
 ## Configuration

@@ -154,3 +154,19 @@ def test_plan_summary_html_includes_absolute_start(tmp_path, monkeypatch):
     assert "10m" in html
     assert "runs" in html and "3" in html
     assert "2026-08-10T09:00:00+00:00" in html
+
+
+def test_streamlit_app_imports_when_autorefresh_missing(tmp_path, monkeypatch):
+    """If `streamlit-autorefresh` is not installed, importing streamlit_app
+    must still succeed and expose a callable `st_autorefresh` stub — the app
+    just runs without auto-polling and shows a warning.
+    """
+    # Ensure streamlit_autorefresh cannot be imported.
+    import sys
+    monkeypatch.setitem(sys.modules, "streamlit_autorefresh", None)
+
+    app_mod, _ = _stub_streamlit_and_load(tmp_path, monkeypatch)
+
+    # The stub must be callable and return an integer (mimicking real signature).
+    result = app_mod.st_autorefresh(interval=5000, key="test")
+    assert result == 0
