@@ -115,6 +115,8 @@ class ScheduledSearchJob:
     interval_minutes: Optional[float] = None
     run_count: Optional[int] = None
     absolute_start_iso: Optional[str] = None
+    task_type: str = "search"
+    reminder_text: Optional[str] = None
     completed_runs: int = 0
     status: str = "pending"  # pending -> running -> completed/cancelled/failed/paused
     created_at: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
@@ -170,6 +172,8 @@ class ScheduledSearchJob:
             "interval_minutes": self.interval_minutes,
             "run_count": self.run_count,
             "absolute_start_iso": self.absolute_start_iso,
+            "task_type": self.task_type,
+            "reminder_text": self.reminder_text,
             "completed_runs": self.completed_runs,
             "status": self.status,
             "created_at": self.created_at,
@@ -187,6 +191,8 @@ class ScheduledSearchJob:
             interval_minutes=payload.get("interval_minutes"),
             run_count=payload.get("run_count"),
             absolute_start_iso=payload.get("absolute_start_iso"),
+            task_type=payload.get("task_type", "search"),
+            reminder_text=payload.get("reminder_text"),
             completed_runs=payload.get("completed_runs", 0),
             status=payload.get("status", "pending"),
             created_at=payload.get("created_at") or datetime.now(timezone.utc).isoformat(),
@@ -322,6 +328,8 @@ class Scheduler:
         search_query: Optional[str] = None,
         absolute_start_iso: Optional[str] = None,
         job_id: Optional[str] = None,
+        task_type: str = "search",
+        reminder_text: Optional[str] = None,
     ) -> ScheduledSearchJob:
         validate_explicit_schedule_values(interval_minutes, run_count)
 
@@ -331,6 +339,8 @@ class Scheduler:
             interval_minutes=interval_minutes,
             run_count=run_count,
             absolute_start_iso=absolute_start_iso,
+            task_type=task_type,
+            reminder_text=reminder_text,
         )
         if job_id:
             job.id = job_id
@@ -467,7 +477,20 @@ class Scheduler:
                     return
 
                 console_print(f"[{job.id}] Starting run {run_number}/{runs}...")
-                state = {"messages": self.message_builder(job.prompt, job.search_query or job.prompt)}
+                # Message builder may accept extra task-typing kwargs; call it
+                # in a way that works with both the old 2-arg and new 4-arg signatures.
+                try:
+                    messages = self.message_builder(
+                        job.prompt,
+                        job.search_query or job.prompt,
+                        task_type=job.task_type,
+                        reminder_text=job.reminder_text,
+                    )
+                except TypeError:
+                    messages = self.message_builder(
+                        job.prompt, job.search_query or job.prompt
+                    )
+                state = {"messages": messages}
 
                 try:
                     result = self._invoke_with_retries(job, state)

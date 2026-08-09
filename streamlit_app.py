@@ -622,6 +622,8 @@ if prompt:
                     run_count=plan.run_count,
                     search_query=plan.search_query,
                     absolute_start_iso=plan.absolute_start_iso,
+                    task_type=plan.task_type,
+                    reminder_text=plan.reminder_text,
                 )
                 start_text = (
                     f"**Schedule started** · id `{job.id}` · "

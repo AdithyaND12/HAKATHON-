@@ -31,6 +31,10 @@ from typing_extensions import Annotated, TypedDict
 
 import config
 from planner import (
+    CalculationExecutionInstruction,
+    ChatExecutionInstruction,
+    RagExecutionInstruction,
+    ReminderExecutionInstruction,
     SearchExecutionInstruction,
     SearchPlan,
     create_search_plan,
@@ -261,14 +265,46 @@ def _sanitize_prompt_for_scheduled_run(prompt: str, search_query: str) -> str:
     return text
 
 
-def _build_messages(prompt: str, search_query: str) -> list[BaseMessage]:
+def _build_messages(prompt: str, search_query: str, task_type: str = "search",
+                    reminder_text: Optional[str] = None) -> list[BaseMessage]:
     """Build the message list for a single scheduled-run invocation.
 
-    We deliberately pass the SANITIZED prompt (no scheduling verbs) rather
-    than the raw user prompt, because some local models refuse tasks that
-    look recurring even after being told the app handles the scheduling.
+    Dispatches on `task_type` so each kind of scheduled task uses the right
+    tool-orchestration instruction. Reminders never nudge toward web_search;
+    calculations route to the calculator tool; RAG routes to get_rag_chunks.
     """
     clean_prompt = _sanitize_prompt_for_scheduled_run(prompt, search_query)
+
+    if task_type == "reminder":
+        text = reminder_text or clean_prompt or search_query
+        return [
+            SystemMessage(content=SCHEDULED_RUN_INSTRUCTIONS),
+            SystemMessage(content=ReminderExecutionInstruction(text).render()),
+            HumanMessage(content="Please deliver the reminder now."),
+        ]
+
+    if task_type == "calculation":
+        return [
+            SystemMessage(content=SCHEDULED_RUN_INSTRUCTIONS),
+            SystemMessage(content=CalculationExecutionInstruction(clean_prompt).render()),
+            HumanMessage(content=clean_prompt),
+        ]
+
+    if task_type == "rag":
+        return [
+            SystemMessage(content=SCHEDULED_RUN_INSTRUCTIONS),
+            SystemMessage(content=RagExecutionInstruction(clean_prompt).render()),
+            HumanMessage(content=clean_prompt),
+        ]
+
+    if task_type == "chat":
+        return [
+            SystemMessage(content=SCHEDULED_RUN_INSTRUCTIONS),
+            SystemMessage(content=ChatExecutionInstruction(clean_prompt).render()),
+            HumanMessage(content=clean_prompt),
+        ]
+
+    # Default: search
     return [
         SystemMessage(content=SCHEDULED_RUN_INSTRUCTIONS),
         SystemMessage(content=SearchExecutionInstruction(search_query).render()),
@@ -296,6 +332,8 @@ def run_scheduled_search(
     run_count: Optional[int] = None,
     search_query: Optional[str] = None,
     absolute_start_iso: Optional[str] = None,
+    task_type: str = "search",
+    reminder_text: Optional[str] = None,
 ) -> ScheduledSearchJob:
     """Start a search schedule in a background thread.
 
@@ -307,6 +345,8 @@ def run_scheduled_search(
         run_count=run_count,
         search_query=search_query,
         absolute_start_iso=absolute_start_iso,
+        task_type=task_type,
+        reminder_text=reminder_text,
     )
 
 
@@ -452,6 +492,8 @@ def run_cli() -> None:
                         run_count=plan.run_count,
                         search_query=plan.search_query,
                         absolute_start_iso=plan.absolute_start_iso,
+                        task_type=plan.task_type,
+                        reminder_text=plan.reminder_text,
                     )
                 except ScheduleValidationError as exc:
                     console_print(f"Invalid schedule: {exc}")
