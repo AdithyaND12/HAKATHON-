@@ -178,10 +178,13 @@ def get_rag_chunks(query: str) -> str:
 # ---- Graph -------------------------------------------------------------------
 
 SCHEDULED_RUN_INSTRUCTIONS = (
-    "This is one execution of an application-managed fixed schedule. "
-    "Perform the user's task immediately using the available tools. "
-    "Do not implement waits for timing, repetition, or scheduling; the "
-    "application handles that between executions."
+    "The user's original request was time-based (recurring/scheduled). "
+    "The application's scheduler has ALREADY handled all timing, waiting, and "
+    "repetition for you. You are now inside one such run. Your ONLY job is to "
+    "perform the underlying task once — call the appropriate tool (usually web "
+    "search) and answer with the results. "
+    "DO NOT refuse the task, DO NOT mention that the request looks recurring, "
+    "and DO NOT say the scheduling is impossible. Just do the task now."
 )
 
 agent_tools = [get_stock_price, search_tool, calculator, get_rag_chunks, get_time]
@@ -223,11 +226,53 @@ chatbot = graph.compile()
 _registry = JobRegistry(config.ensure_data_dir())
 
 
+def _sanitize_prompt_for_scheduled_run(prompt: str, search_query: str) -> str:
+    """Rewrite the user's original prompt so the LLM doesn't latch on to the
+    scheduling verbs (which cause some local models to refuse the whole task).
+
+    Strategy: drop everything that looks like a schedule directive, keep the
+    task words. If the resulting prompt looks empty or trivial, fall back to
+    the planner's cleaned `search_query`.
+    """
+    import re
+    text = prompt
+    # Remove "every N minutes/hours/days" phrases.
+    text = re.sub(
+        r"\b(?:for\s+)?(?:every|each)\s+\S+\s*"
+        r"(?:seconds?|secs?|minutes?|mins?|hours?|hrs?|days?)\b",
+        " ", text, flags=re.IGNORECASE,
+    )
+    # Remove "for N times/runs/checks".
+    text = re.sub(
+        r"\b(?:for\s+)?\S+\s*(?:times?|runs?|checks?|iterations?)\b",
+        " ", text, flags=re.IGNORECASE,
+    )
+    # Remove standalone scheduling words.
+    text = re.sub(
+        r"\b(?:hourly|daily|weekly|monthly|repeatedly|periodically|recurring|"
+        r"repeat|monitor|refresh|schedule|at\s+\d{1,2}(?::\d{2})?\s*(?:am|pm)?|"
+        r"tomorrow|tonight|in\s+\d+\s+(?:minutes?|mins?|hours?|hrs?))\b",
+        " ", text, flags=re.IGNORECASE,
+    )
+    text = re.sub(r"\s+", " ", text).strip(" ,.!?")
+    # If we stripped too much, fall back to the planner's search_query.
+    if len(text.split()) < 2:
+        return search_query
+    return text
+
+
 def _build_messages(prompt: str, search_query: str) -> list[BaseMessage]:
+    """Build the message list for a single scheduled-run invocation.
+
+    We deliberately pass the SANITIZED prompt (no scheduling verbs) rather
+    than the raw user prompt, because some local models refuse tasks that
+    look recurring even after being told the app handles the scheduling.
+    """
+    clean_prompt = _sanitize_prompt_for_scheduled_run(prompt, search_query)
     return [
         SystemMessage(content=SCHEDULED_RUN_INSTRUCTIONS),
         SystemMessage(content=SearchExecutionInstruction(search_query).render()),
-        HumanMessage(content=prompt),
+        HumanMessage(content=clean_prompt),
     ]
 
 
