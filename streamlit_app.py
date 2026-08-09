@@ -202,7 +202,106 @@ html, body, [data-testid="stAppViewContainer"] {
     color: var(--accent);
 }
 
-/* Info banner for scheduled runs */
+/* Scheduled-run cards — prominent, distinct from regular chat */
+.sched-card {
+    font-family: var(--sans);
+    background: linear-gradient(180deg, rgba(255, 180, 84, 0.06), rgba(255, 180, 84, 0.02));
+    border: 1px solid rgba(255, 180, 84, 0.3);
+    border-left: 3px solid var(--accent-2);
+    border-radius: 10px;
+    padding: 1rem 1.15rem;
+    margin: 0.5rem 0;
+    box-shadow: 0 4px 24px rgba(0, 0, 0, 0.25);
+}
+.sched-card .sched-head {
+    display: flex;
+    align-items: center;
+    gap: 0.6rem;
+    flex-wrap: wrap;
+    font-family: var(--mono);
+    font-size: 0.78rem;
+    color: var(--fg-dim);
+    margin-bottom: 0.65rem;
+    padding-bottom: 0.65rem;
+    border-bottom: 1px dashed var(--border);
+}
+.sched-card .sched-badge {
+    background: var(--accent-2);
+    color: var(--bg-0);
+    padding: 0.15rem 0.55rem;
+    border-radius: 999px;
+    font-weight: 700;
+    font-size: 0.72rem;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+}
+.sched-card .sched-jobid {
+    background: var(--bg-2);
+    color: var(--accent);
+    padding: 0.1rem 0.5rem;
+    border-radius: 4px;
+    font-family: var(--mono);
+}
+.sched-card .sched-runno {
+    color: var(--fg-1);
+    font-weight: 600;
+}
+.sched-card .sched-time {
+    color: var(--fg-dim);
+    margin-left: auto;
+    font-size: 0.72rem;
+}
+.sched-card .sched-body {
+    font-size: 0.95rem;
+    line-height: 1.6;
+    color: var(--fg-0);
+}
+.sched-card .sched-body pre {
+    background: var(--bg-2) !important;
+    padding: 0.6rem !important;
+    border-radius: 6px;
+}
+
+/* Active-schedules status strip above the chat */
+.sched-strip {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.5rem;
+    padding: 0.5rem 0 1rem 0;
+    margin-bottom: 0.75rem;
+    border-bottom: 1px dashed var(--border);
+}
+.sched-chip {
+    font-family: var(--mono);
+    font-size: 0.72rem;
+    background: var(--bg-1);
+    border: 1px solid var(--border);
+    border-left: 2px solid var(--accent);
+    padding: 0.35rem 0.6rem 0.35rem 0.55rem;
+    border-radius: 6px;
+    color: var(--fg-0);
+    display: inline-flex;
+    align-items: center;
+    gap: 0.5rem;
+}
+.sched-chip .sc-id { color: var(--accent-2); }
+.sched-chip .sc-status {
+    padding: 0.05rem 0.4rem;
+    border-radius: 3px;
+    font-size: 0.65rem;
+    text-transform: uppercase;
+    background: var(--bg-2);
+    color: var(--fg-1);
+}
+.sched-chip .sc-status.running { color: var(--accent); }
+.sched-chip .sc-status.paused { color: var(--accent-2); }
+.sched-chip .sc-progress {
+    color: var(--fg-1);
+    font-variant-numeric: tabular-nums;
+}
+.sched-chip .sc-next { color: var(--fg-dim); }
+
+/* Info banner for scheduled runs (kept as compact fallback) */
 .scheduled-banner {
     font-family: var(--mono);
     font-size: 0.78rem;
@@ -270,13 +369,23 @@ if "resumed_once" not in st.session_state:
 # Streamlit only reruns on user interaction, so background scheduled runs would
 # never surface unless the user typed something. When there are active schedules
 # in the registry, poll every few seconds so completed runs appear on their own.
+# We also poll for a short grace window after the *last* active job finishes
+# so the final run(s) can flush into the chat.
 
 _active_now = _registry.active()
 if _active_now:
+    st.session_state["_last_active_at"] = datetime.now().timestamp()
+
+_grace_active = False
+_last_seen = st.session_state.get("_last_active_at")
+if _last_seen and (datetime.now().timestamp() - _last_seen) < 15:
+    _grace_active = True
+
+if _active_now or _grace_active:
     # Interval in milliseconds. Every tick triggers a full script rerun, which
     # re-executes `_fetch_new_scheduled_runs()` below and picks up new files
     # written by the scheduler's daemon threads.
-    st_autorefresh(interval=5000, key=f"poll_history_{len(_active_now)}")
+    st_autorefresh(interval=3000, key="poll_history")
 
 
 # ---- Helpers -----------------------------------------------------------------
@@ -375,30 +484,103 @@ with st.sidebar:
 # ---- Render chat history -----------------------------------------------------
 
 for message in st.session_state.messages:
-    with st.chat_message(message["role"]):
-        st.markdown(message["content"])
+    role = message["role"]
+    # Render pre-formatted scheduled-run cards as raw HTML+markdown; keep
+    # regular chat bubbles as plain st.markdown so they get the bubble style.
+    if role == "assistant" and message.get("kind") == "scheduled_run":
+        st.markdown(message["content"], unsafe_allow_html=True)
+    else:
+        with st.chat_message(role):
+            st.markdown(message["content"])
+
+
+# ---- Active schedules status strip ------------------------------------------
+# Show a compact chip row for every active job so users see progress even
+# when the current run is still in flight (i.e. no history file yet).
+
+if _active_now:
+    def _status_class(status: str) -> str:
+        return status if status in ("running", "paused", "pending") else ""
+
+    chips = []
+    for job in _active_now:
+        progress = f"{job.completed_runs}/{job.run_count or '?'}"
+        next_run = job.next_run_at or "—"
+        # Trim ISO string to HH:MM for display
+        try:
+            next_run_short = (
+                datetime.fromisoformat(next_run.replace("Z", "+00:00")).strftime("%H:%M")
+                if next_run != "—" else "—"
+            )
+        except (ValueError, TypeError, AttributeError):
+            next_run_short = next_run
+        chips.append(
+            f'<span class="sched-chip">'
+            f'<span class="sc-id">◉ {job.id}</span>'
+            f'<span class="sc-status {_status_class(job.status)}">{job.status}</span>'
+            f'<span class="sc-progress">{progress}</span>'
+            f'<span class="sc-next">next {next_run_short}</span>'
+            f'</span>'
+        )
+    st.markdown(
+        f'<div class="sched-strip">{"".join(chips)}</div>',
+        unsafe_allow_html=True,
+    )
 
 
 # ---- Handle any newly-completed scheduled runs ------------------------------
 
-new_runs = _fetch_new_scheduled_runs()
-for run in new_runs:
-    banner = (
-        f'<div class="scheduled-banner">'
-        f'▸ scheduled run <code>{run["job_id"]}</code> · '
-        f'#{run["run_number"]} · {run["completed_at"]}'
+
+def _render_scheduled_run_card(run: dict) -> str:
+    """Return the HTML string for a single scheduled-run card."""
+    # Human-friendly time (HH:MM:SS).
+    ts_short = run["completed_at"]
+    try:
+        ts_short = datetime.fromisoformat(
+            run["completed_at"].replace("Z", "+00:00")
+        ).strftime("%H:%M:%S")
+    except (ValueError, AttributeError):
+        pass
+    return (
+        f'<div class="sched-card">'
+        f'<div class="sched-head">'
+        f'<span class="sched-badge">scheduled run</span>'
+        f'<span class="sched-jobid">{run["job_id"]}</span>'
+        f'<span class="sched-runno">run #{run["run_number"]}</span>'
+        f'<span class="sched-time">{ts_short}</span>'
+        f'</div>'
+        f'<div class="sched-body">{_markdown_to_html(run["content"])}</div>'
         f'</div>'
     )
-    with st.chat_message("assistant"):
-        st.markdown(banner, unsafe_allow_html=True)
-        st.markdown(run["content"])
+
+
+def _markdown_to_html(text: str) -> str:
+    """Very lightweight markdown → HTML for the sched-card body.
+
+    We deliberately do not pull in a full markdown lib — the LLM output is
+    usually simple lists and bold spans. Falls back to `<br>`-preserved text.
+    """
+    import html
+    import re
+    escaped = html.escape(text)
+    # **bold**
+    escaped = re.sub(r"\*\*(.+?)\*\*", r"<strong>\1</strong>", escaped)
+    # `code`
+    escaped = re.sub(r"`([^`]+)`", r"<code>\1</code>", escaped)
+    # newlines
+    escaped = escaped.replace("\n", "<br>")
+    return escaped
+
+
+new_runs = _fetch_new_scheduled_runs()
+for run in new_runs:
+    card_html = _render_scheduled_run_card(run)
+    st.markdown(card_html, unsafe_allow_html=True)
     st.session_state.messages.append(
         {
             "role": "assistant",
-            "content": (
-                f"**Scheduled run** `{run['job_id']}` · #{run['run_number']}\n\n"
-                f"{run['content']}"
-            ),
+            "kind": "scheduled_run",
+            "content": card_html,
         }
     )
 

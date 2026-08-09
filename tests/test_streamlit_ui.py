@@ -170,3 +170,39 @@ def test_streamlit_app_imports_when_autorefresh_missing(tmp_path, monkeypatch):
     # The stub must be callable and return an integer (mimicking real signature).
     result = app_mod.st_autorefresh(interval=5000, key="test")
     assert result == 0
+
+
+def test_render_scheduled_run_card_produces_expected_html(tmp_path, monkeypatch):
+    app_mod, _ = _stub_streamlit_and_load(tmp_path, monkeypatch)
+    run = {
+        "job_id": "abc12345",
+        "run_number": 2,
+        "completed_at": "2026-08-09T17:37:56.786280+00:00",
+        "content": "**Bold text** and a bullet\n- point one\n- point two",
+    }
+    html = app_mod._render_scheduled_run_card(run)
+    assert 'class="sched-card"' in html
+    assert 'class="sched-badge"' in html
+    assert "scheduled run" in html
+    assert "abc12345" in html
+    assert "run #2" in html
+    # Time was reformatted to HH:MM:SS
+    assert "17:37:56" in html
+    # Bold markdown got converted
+    assert "<strong>Bold text</strong>" in html
+
+
+def test_markdown_to_html_handles_bold_code_and_newlines(tmp_path, monkeypatch):
+    app_mod, _ = _stub_streamlit_and_load(tmp_path, monkeypatch)
+    out = app_mod._markdown_to_html("Hello **world** with `code` and\nnewline")
+    assert "<strong>world</strong>" in out
+    assert "<code>code</code>" in out
+    assert "<br>" in out
+
+
+def test_markdown_to_html_escapes_html_tags_from_llm_output(tmp_path, monkeypatch):
+    """LLM output is untrusted — must not allow raw HTML injection into the card."""
+    app_mod, _ = _stub_streamlit_and_load(tmp_path, monkeypatch)
+    out = app_mod._markdown_to_html('<script>alert("xss")</script>')
+    assert "<script>" not in out
+    assert "&lt;script&gt;" in out
