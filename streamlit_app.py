@@ -21,6 +21,7 @@ from pathlib import Path
 
 import streamlit as st
 from langchain_core.messages import HumanMessage, SystemMessage
+from streamlit_autorefresh import st_autorefresh
 
 # Reuse everything the CLI used.
 import config
@@ -246,6 +247,19 @@ if "resumed_once" not in st.session_state:
         pass
 
 
+# ---- Auto-refresh ------------------------------------------------------------
+# Streamlit only reruns on user interaction, so background scheduled runs would
+# never surface unless the user typed something. When there are active schedules
+# in the registry, poll every few seconds so completed runs appear on their own.
+
+_active_now = _registry.active()
+if _active_now:
+    # Interval in milliseconds. Every tick triggers a full script rerun, which
+    # re-executes `_fetch_new_scheduled_runs()` below and picks up new files
+    # written by the scheduler's daemon threads.
+    st_autorefresh(interval=5000, key=f"poll_history_{len(_active_now)}")
+
+
 # ---- Helpers -----------------------------------------------------------------
 
 
@@ -422,6 +436,9 @@ if prompt:
                 st.session_state.messages.append(
                     {"role": "assistant", "content": start_text}
                 )
+                # Force a rerun so the auto-refresh block at the top of the
+                # script picks up the new active schedule and starts polling.
+                st.rerun()
             except ScheduleValidationError as exc:
                 err = f"Invalid schedule: {exc}"
                 st.error(err)
