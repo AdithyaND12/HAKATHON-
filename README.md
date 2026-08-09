@@ -52,7 +52,7 @@ source .venv/bin/activate    # Windows: .venv\Scripts\activate
 pip install \
   arrow chromadb ddgs langchain-community langchain-chroma langchain-core \
   langchain-openai langchain-text-splitters langgraph pydantic pymupdf \
-  python-dotenv requests pytest
+  python-dotenv requests pytest streamlit
 ```
 
 ## Configuration
@@ -79,41 +79,46 @@ cp .env.example .env
 
 The local `.env` file is ignored by Git. Never commit real API keys.
 
-## Running the chatbot
+## Running the chatbot (Streamlit UI)
 
-Start LM Studio's local server with the configured models loaded, then:
+The primary interface is now a Streamlit web app with a dark, terminal-inspired
+aesthetic. Start LM Studio's local server with the configured models loaded, then:
+
+```bash
+streamlit run streamlit_app.py
+```
+
+Open the URL Streamlit prints (usually http://localhost:8501). The interface is
+intentionally minimal: one chat window. Scheduling still works — just describe
+it in natural language.
+
+### Example prompts
+
+```
+What are the latest technology headlines?
+Calculate 27 times 14.
+What does the Constitution say about freedom of speech?
+What is the current price of AAPL?
+Check the latest Python news every 1 minute for 3 times.
+Monitor tesla stock hourly for 5 times.
+Search AI news tomorrow at 9am.
+Search python releases at 3pm.
+```
+
+Started a schedule? Each completed run appears back in the chat automatically
+as an amber-highlighted message. Use the collapsed sidebar (top-left `»`) to
+view active schedules, clear the chat, or cancel every running job.
+
+### Legacy CLI (optional)
+
+If you prefer the terminal, the old CLI still works:
 
 ```bash
 python app.py
 ```
 
-### Slash commands
-
-```
-/help                Show help
-/jobs                List every job registered in this session
-/cancel <id>         Cancel a running job
-/pause <id>          Pause a job (finishes the current run, then waits)
-/resume <id>         Resume a paused job
-/logs <id>           Show the last recorded run for a job
-/clear               Remove finished / cancelled / failed jobs from the list
-exit | quit | q      Leave the CLI (running schedules are stopped)
-```
-
-### Example prompts
-
-```
-You: What are the latest technology headlines?
-You: Calculate 27 times 14.
-You: What does the Constitution say about freedom of speech?
-You: What is the current price of AAPL?
-You: Check the latest Python news every 1 minute for 3 times.
-You: Monitor tesla stock hourly for 5 times.
-You: Search AI news tomorrow at 9am.
-You: Search python releases at 3pm.
-You: /jobs
-You: /cancel a1b2c3d4
-```
+Slash commands: `/help /jobs /cancel <id> /pause <id> /resume <id> /logs <id>
+/clear`.
 
 ## Persistence
 
@@ -143,14 +148,16 @@ persistence, resume, pause, cancel, no-wait-after-final-run).
 ## Project structure
 
 ```
-app.py                CLI entry point + LangGraph wiring + tools
+streamlit_app.py      Primary UI — dark terminal-inspired chat (Streamlit)
+app.py                Legacy CLI + LangGraph wiring + tools (imported by streamlit_app)
 config.py             Centralised env parsing
 planner.py            Search + schedule planner (LLM + regex fallback + absolute time)
 scheduler.py          Job registry, persistence, retries, pause/resume
 tools_search.py       DuckDuckGo tool with retry / backoff
 ragtool.py            Constitution PDF indexing + retrieval
+.streamlit/config.toml Dark theme config
 tests/                pytest suite
-pdfs/                 Default Constitution PDF
+pdfs/                  Default Constitution PDF
 .hakathon/            Runtime data (jobs.json, per-job history) — git-ignored
 constitution_chroma_db/  Vector store — git-ignored
 ```
