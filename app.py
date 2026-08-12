@@ -46,6 +46,7 @@ from scheduler import (
     Scheduler,
     console_print,
     format_jobs_table,
+    _extract_content,
 )
 from tools_search import search_tool
 from ragtool import retrieve_constitution_chunks
@@ -436,7 +437,7 @@ def _run_one_off(user_input: str, plan: SearchPlan) -> None:
             ]
         }
     )
-    console_print(f"Assistant: {out['messages'][-1].content}")
+    console_print(f"Assistant: {_extract_content(out)}")
 
 
 def run_cli() -> None:

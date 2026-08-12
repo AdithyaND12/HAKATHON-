@@ -46,7 +46,7 @@ except ImportError:  # pragma: no cover - only hit when the optional dep is miss
 import config
 from app import _build_messages, _registry, chatbot, scheduler
 from planner import SearchExecutionInstruction, SearchPlan, create_search_plan
-from scheduler import ScheduleValidationError
+from scheduler import ScheduleValidationError, _extract_content
 
 
 # ---- Page config -------------------------------------------------------------
@@ -401,7 +401,7 @@ def _run_chatbot(prompt: str, plan: SearchPlan) -> str:
             ]
         }
     )
-    return str(out["messages"][-1].content)
+    return _extract_content(out)
 
 
 def _fetch_new_scheduled_runs() -> list[dict]:
