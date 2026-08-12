@@ -1,8 +1,8 @@
 """Search + scheduling planner.
 
 The planner turns a natural-language user prompt into a strict `TaskPlan`.
-The primary path uses the LLM in JSON mode; a rich regex fallback keeps the
-CLI working when a local model does not honour JSON output.
+The primary path uses structured LLM output; a rich regex fallback keeps the
+CLI working when the model cannot return the expected shape.
 
 `TaskPlan` (aliased as `SearchPlan` for backward compatibility) now carries a
 `task_type` field so scheduled runs can be routed to the right execution
@@ -24,12 +24,13 @@ from __future__ import annotations
 import logging
 import math
 import re
+import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Literal, Optional
 
 from langchain_core.messages import HumanMessage, SystemMessage
-from langchain_openai import ChatOpenAI
+from langchain_google_genai import ChatGoogleGenerativeAI
 from pydantic import BaseModel, Field
 
 import config
@@ -393,11 +394,10 @@ def _detect_task_type(prompt: str, cleaned_query: str) -> tuple[TaskType, Option
 # ---- LLM planner --------------------------------------------------------------
 
 
-def _build_llm() -> ChatOpenAI:
-    return ChatOpenAI(
-        model=config.LM_STUDIO_MODEL,
-        base_url=config.LM_STUDIO_BASE_URL,
-        api_key=config.LM_STUDIO_API_KEY,
+def _build_llm() -> ChatGoogleGenerativeAI:
+    return ChatGoogleGenerativeAI(
+        model=config.GEMINI_MODEL,
+        google_api_key=config.GEMINI_API_KEY,
     )
 
 
@@ -409,15 +409,42 @@ def _build_search_planner(method: str):
     return _llm.with_structured_output(SearchPlan, method=method)
 
 
-# LM Studio's newer builds reject `response_format.type=json_object` (what
-# `method="json_mode"` sends) and require `json_schema` or `text` instead.
-# We try `json_schema` first, then fall back to `json_mode` (for older LM Studio
-# / OpenAI-compatible servers), then to `function_calling`. The regex fallback
-# in `create_search_plan` still catches any remaining failure.
-_PLANNER_METHODS = ("json_schema", "json_mode", "function_calling")
+# Prefer function-calling for Gemini and keep additional methods as fallbacks
+# for compatibility with any alternate backend.
+_PLANNER_METHODS = ("function_calling", "json_schema", "json_mode")
 
 search_planner = _build_search_planner(_PLANNER_METHODS[0])
 _current_planner_method_index = 0
+
+LLM_MAX_RETRIES = 3
+LLM_RETRY_BACKOFF_SECONDS = 2.0
+
+_TRANSIENT_API_ERROR_RE = re.compile(
+    r"\b(?:429|50[0-9])\b|UNAVAILABLE|RESOURCE_EXHAUSTED|high demand|rate limit",
+    re.IGNORECASE,
+)
+
+
+def is_transient_api_error(exc: BaseException) -> bool:
+    """True for server-side / rate-limit errors worth retrying."""
+    return bool(_TRANSIENT_API_ERROR_RE.search(str(exc)))
+
+
+def _invoke_with_transient_retry(call, attempts: int = LLM_MAX_RETRIES,
+                                 backoff: float = LLM_RETRY_BACKOFF_SECONDS):
+    """Retry a callable only on transient API errors (429/5xx); re-raise others."""
+    for attempt in range(1, attempts + 1):
+        try:
+            return call()
+        except Exception as exc:  # noqa: BLE001
+            if attempt == attempts or not is_transient_api_error(exc):
+                raise
+            sleep_for = backoff * (2 ** (attempt - 1))
+            log.warning(
+                "Transient API error on attempt %d/%d (%s). Retrying in %.1fs.",
+                attempt, attempts, exc, sleep_for,
+            )
+            time.sleep(sleep_for)
 
 
 def _invoke_search_planner(messages: list) -> SearchPlan:
@@ -430,7 +457,9 @@ def _invoke_search_planner(messages: list) -> SearchPlan:
             search_planner = _build_search_planner(method)
             _current_planner_method_index = index
         try:
-            return search_planner.invoke(messages)
+            return _invoke_with_transient_retry(
+                lambda: search_planner.invoke(messages)
+            )
         except Exception as exc:  # noqa: BLE001
             last_error = exc
             error_text = str(exc)

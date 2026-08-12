@@ -557,6 +557,27 @@ class Scheduler:
 # ---- Utilities ----------------------------------------------------------------
 
 
+def _content_to_text(content: object) -> str:
+    """Flatten LangChain/GenAI message content (string or block list) to text.
+
+    Newer `langchain-google-genai` returns `content` as a list of blocks like
+    `[{'type': 'text', 'text': '...'}]`; older versions returned a plain string.
+    """
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts: list[str] = []
+        for block in content:
+            if isinstance(block, str):
+                parts.append(block)
+            elif isinstance(block, dict) and block.get("type") == "text":
+                parts.append(str(block.get("text", "")))
+            else:
+                parts.append(str(block))
+        return "".join(parts)
+    return str(content)
+
+
 def _extract_content(result: Any) -> str:
     """Best-effort extraction of a printable assistant message from a chatbot result."""
     try:
@@ -565,7 +586,7 @@ def _extract_content(result: Any) -> str:
         content = getattr(last, "content", None)
         if content is None and isinstance(last, dict):
             content = last.get("content")
-        return str(content) if content is not None else str(result)
+        return _content_to_text(content)
     except (KeyError, IndexError, TypeError):
         return str(result)
 

@@ -46,7 +46,7 @@ except ImportError:  # pragma: no cover - only hit when the optional dep is miss
 import config
 from app import _build_messages, _registry, chatbot, scheduler
 from planner import SearchExecutionInstruction, SearchPlan, create_search_plan
-from scheduler import ScheduleValidationError
+from scheduler import ScheduleValidationError, _extract_content
 
 
 # ---- Page config -------------------------------------------------------------
@@ -401,7 +401,7 @@ def _run_chatbot(prompt: str, plan: SearchPlan) -> str:
             ]
         }
     )
-    return str(out["messages"][-1].content)
+    return _extract_content(out)
 
 
 def _fetch_new_scheduled_runs() -> list[dict]:
@@ -452,7 +452,7 @@ st.markdown(
 <div class="term-header">
   <span class="dim">$</span> HAKATHON <span class="accent">//</span> chat
 </div>
-<div class="term-sub"><span class="dot"></span> LangGraph + LM Studio · dark terminal build</div>
+<div class="term-sub"><span class="dot"></span> LangGraph + Gemini · dark terminal build</div>
 """,
     unsafe_allow_html=True,
 )
@@ -462,8 +462,8 @@ st.markdown(
 
 with st.sidebar:
     st.markdown("### session")
-    st.caption(f"model: `{config.LM_STUDIO_MODEL}`")
-    st.caption(f"endpoint: `{config.LM_STUDIO_BASE_URL}`")
+    st.caption(f"model: `{config.GEMINI_MODEL}`")
+    st.caption(f"embedding: `{config.GEMINI_EMBEDDING_MODEL}`")
     active = _registry.active()
     st.caption(f"active schedules: **{len(active)}**")
     if active:
@@ -651,6 +651,6 @@ if prompt:
                 try:
                     reply = _run_chatbot(prompt, plan)
                 except Exception as exc:  # noqa: BLE001
-                    reply = f"⚠️ Error talking to LM Studio: `{exc}`"
+                    reply = f"⚠️ Error talking to Gemini: `{exc}`"
             st.markdown(reply)
             st.session_state.messages.append({"role": "assistant", "content": reply})

@@ -1,6 +1,6 @@
 # HAKATHON-
 
-An interactive LangGraph chatbot powered by an OpenAI-compatible LM Studio server.
+An interactive LangGraph chatbot powered by Google Gemini.
 It combines web search, calculations, time lookup, stock prices, and retrieval from
 the Constitution of India PDF. It can also repeat searches on a robust background
 schedule while the CLI remains available for new requests.
@@ -21,17 +21,17 @@ The scheduling engine was rewritten to fix the pain points of the original:
   *"tomorrow 9am"*, or *"in 5 minutes"* are parsed and honored.
 - **Improved fallback planner** — recognises *hourly*, *daily*, *every day at X*,
   *twice*, *thrice*, *in N minutes*.
-- **Separate embedding model** — `LM_STUDIO_EMBEDDING_MODEL` fixes the #1 cause of
-  Constitution RAG failing on first run (the chat model rarely supports embeddings).
+- **Separate embedding model** — `GEMINI_EMBEDDING_MODEL` keeps Constitution RAG
+  aligned with a dedicated embedding model.
 
 ## Features
 
-- Local chat and tool-calling through LM Studio.
+- Local chat and tool-calling through Gemini.
 - Web search via DuckDuckGo (wrapped with retry + backoff).
 - Calculator and current-time tools.
 - Alpha Vantage stock-price lookup with structured error taxonomy.
-- Constitution PDF retrieval using PyMuPDF, LangChain text splitting, an OpenAI-
-  compatible embedding model, and Chroma.
+- Constitution PDF retrieval using PyMuPDF, LangChain text splitting, a Gemini
+  embedding model, and Chroma.
 - Natural-language scheduling: *"check tesla news every 10 minutes for 5 times"*,
   *"search AI news at 3pm"*, *"monitor python news hourly"*.
 - Background scheduled jobs with cancellation, pause/resume, persistence, and
@@ -40,8 +40,8 @@ The scheduling engine was rewritten to fix the pain points of the original:
 ## Requirements
 
 - Python 3.10 or newer.
-- [LM Studio](https://lmstudio.ai/) running an OpenAI-compatible local server.
-- A chat model **and** a separate embedding model available in LM Studio.
+- A Gemini API key.
+- A chat model **and** a separate embedding model available in Gemini.
 - An Alpha Vantage API key if stock-price lookups are required.
 
 ## Installation
@@ -60,7 +60,7 @@ If you'd rather install manually:
 ```bash
 pip install \
   arrow chromadb ddgs langchain-community langchain-chroma langchain-core \
-  langchain-openai langchain-text-splitters langgraph pydantic pymupdf \
+  langchain-google-genai langchain-text-splitters langgraph pydantic pymupdf \
   python-dotenv requests pytest streamlit streamlit-autorefresh
 ```
 
@@ -72,10 +72,9 @@ cp .env.example .env
 
 | Variable | Required | Default | Description |
 | --- | --- | --- | --- |
-| `LM_STUDIO_MODEL` | Yes | `qwen2.5-coder-7b-instruct` | Chat model served by LM Studio. |
-| `LM_STUDIO_EMBEDDING_MODEL` | For RAG | `nomic-embed-text-v1.5` | Embedding model (must be a real embedding model, not a chat model). |
-| `LM_STUDIO_BASE_URL` | Yes | `http://localhost:1234/v1` | OpenAI-compatible LM Studio endpoint. |
-| `LM_STUDIO_API_KEY` | No | `lm-studio` | Key accepted by the local server. |
+| `GEMINI_API_KEY` | Yes | — | Google Gemini API key. |
+| `GEMINI_MODEL` | Yes | `gemini-3.5-flash-lite` | Chat model. |
+| `GEMINI_EMBEDDING_MODEL` | For RAG | `gemini-embedding-001` | Embedding model for Constitution RAG. |
 | `ALPHAVANTAGE_API_KEY` | For stocks | — | Alpha Vantage API key. |
 | `CONSTITUTION_PDF_PATH` | No | `pdfs/c9fe9c9b6840524844316f74bb1c556c.pdf` | PDF path (relative or absolute). |
 | `HTTP_TIMEOUT_SECONDS` | No | `10` | Timeout for stock API requests. |
@@ -91,7 +90,7 @@ The local `.env` file is ignored by Git. Never commit real API keys.
 ## Running the chatbot (Streamlit UI)
 
 The primary interface is now a Streamlit web app with a dark, terminal-inspired
-aesthetic. Start LM Studio's local server with the configured models loaded, then:
+aesthetic. Set your Gemini env vars, then:
 
 ```bash
 streamlit run streamlit_app.py
@@ -140,8 +139,8 @@ Slash commands: `/help /jobs /cancel <id> /pause <id> /resume <id> /logs <id>
 
 The first Constitution query indexes the configured PDF into the local
 `constitution_chroma_db/` directory. A `sha256` marker is written so re-indexing
-runs automatically whenever the PDF changes. `LM_STUDIO_EMBEDDING_MODEL` must be a
-real embedding model (e.g., `nomic-embed-text-v1.5`, `bge-small-en-v1.5`).
+runs automatically whenever the PDF changes. `GEMINI_EMBEDDING_MODEL` should be a
+valid Gemini embedding model (default: `gemini-embedding-001`).
 
 ## Tests
 
@@ -149,7 +148,7 @@ real embedding model (e.g., `nomic-embed-text-v1.5`, `bge-small-en-v1.5`).
 pytest -q
 ```
 
-Tests mock every network + LLM call, so no LM Studio or Alpha Vantage key is needed.
+Tests mock every network + LLM call, so no Gemini or Alpha Vantage key is needed.
 The suite covers: config parsing, stock error taxonomy, RAG configuration, planner
 regex fallback (including absolute times), and the full scheduler (retries,
 persistence, resume, pause, cancel, no-wait-after-final-run).
@@ -173,10 +172,10 @@ constitution_chroma_db/  Vector store — git-ignored
 
 ## Troubleshooting
 
-- **LM Studio connection error**: confirm the server is running and
-  `LM_STUDIO_BASE_URL` matches its endpoint.
-- **Constitution RAG errors like "not a valid embedding model"**: set
-  `LM_STUDIO_EMBEDDING_MODEL` to an actual embedding model loaded in LM Studio.
+- **Gemini authentication error**: confirm `GEMINI_API_KEY` is set correctly in
+  your `.env`.
+- **Constitution RAG embedding errors**: set `GEMINI_EMBEDDING_MODEL` to a valid
+  Gemini embedding model (the default is `gemini-embedding-001`).
 - **Stock lookup unavailable**: set `ALPHAVANTAGE_API_KEY` in `.env`; the rest of
   the chatbot remains usable without it.
 - **A schedule seems stuck**: run `/jobs` to see its state (`pending`, `running`,

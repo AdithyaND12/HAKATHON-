@@ -7,7 +7,7 @@ ddgs
 langchain-community
 langchain-chroma
 langchain-core
-langchain-openai
+langchain-google-genai
 langchain-text-splitters
 langgraph
 pydantic

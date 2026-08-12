@@ -26,12 +26,9 @@ def test_missing_pdf_raises_actionable_error(monkeypatch, tmp_path):
 
 
 def test_embedding_model_uses_environment_configuration(monkeypatch):
-    monkeypatch.setattr(ragtool, "LM_STUDIO_EMBEDDING_MODEL", "embedding-model")
-    monkeypatch.setattr(ragtool, "LM_STUDIO_BASE_URL", "http://example.test/v1")
-    monkeypatch.setattr(ragtool, "LM_STUDIO_API_KEY", "test-key")
+    monkeypatch.setattr(ragtool, "GEMINI_EMBEDDING_MODEL", "embedding-model")
+    monkeypatch.setattr(ragtool, "GEMINI_API_KEY", "test-key")
 
     embedding_model = ragtool._get_embedding_model()
 
     assert embedding_model.model == "embedding-model"
-    assert embedding_model.openai_api_base == "http://example.test/v1"
-    assert embedding_model.openai_api_key.get_secret_value() == "test-key"

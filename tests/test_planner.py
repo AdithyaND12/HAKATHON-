@@ -93,7 +93,7 @@ def test_cheap_prompt_skips_llm(monkeypatch):
 
 def test_llm_failure_falls_back_gracefully(monkeypatch):
     def boom(messages):
-        raise RuntimeError("LM Studio down")
+        raise RuntimeError("Gemini API unavailable")
 
     monkeypatch.setattr(planner, "_invoke_search_planner", boom)
     plan = planner.create_search_plan("check tesla stock every 5 minutes for 3 times")
@@ -102,13 +102,12 @@ def test_llm_failure_falls_back_gracefully(monkeypatch):
     assert plan.run_count == 3
 
 
-def test_planner_uses_json_schema_method_first():
-    """LM Studio requires `json_schema` for response_format.type."""
-    assert planner._PLANNER_METHODS[0] == "json_schema"
+def test_planner_uses_function_calling_method_first():
+    assert planner._PLANNER_METHODS[0] == "function_calling"
 
 
 def test_planner_falls_over_to_next_method_on_response_format_error(monkeypatch):
-    """When a server rejects `json_schema`, the planner must try the next method."""
+    """When a server rejects one structured-output method, planner tries the next."""
     # Reset the module-level index so this test is deterministic.
     monkeypatch.setattr(planner, "_current_planner_method_index", 0)
 
@@ -120,9 +119,9 @@ def test_planner_falls_over_to_next_method_on_response_format_error(monkeypatch)
 
         def invoke(self, messages):
             attempts.append(self.method)
-            if self.method == "json_schema":
+            if self.method == "function_calling":
                 raise RuntimeError(
-                    "Error code: 400 - {'error': \"'response_format.type' must be 'json_schema' or 'text'\"}"
+                    "Error code: 400 - {'error': \"response_format not supported for method\"}"
                 )
             return planner.SearchPlan(
                 search_query="ok", should_schedule=False, wait_minutes=0, run_count=1
@@ -132,12 +131,12 @@ def test_planner_falls_over_to_next_method_on_response_format_error(monkeypatch)
         return FakePlanner(method)
 
     monkeypatch.setattr(planner, "_build_search_planner", fake_builder)
-    monkeypatch.setattr(planner, "search_planner", fake_builder("json_schema"))
+    monkeypatch.setattr(planner, "search_planner", fake_builder("function_calling"))
 
     result = planner._invoke_search_planner([{"role": "user", "content": "hi"}])
     assert result.search_query == "ok"
+    assert "function_calling" in attempts
     assert "json_schema" in attempts
-    assert "json_mode" in attempts
     # Once failover happens, subsequent calls skip the broken method.
     assert planner._current_planner_method_index >= 1
 

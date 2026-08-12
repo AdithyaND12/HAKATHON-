@@ -23,7 +23,7 @@ import requests
 from dotenv import load_dotenv
 from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage
 from langchain_core.tools import tool
-from langchain_openai import ChatOpenAI
+from langchain_google_genai import ChatGoogleGenerativeAI
 from langgraph.graph import StateGraph, START
 from langgraph.graph.message import add_messages
 from langgraph.prebuilt import ToolNode, tools_condition
@@ -37,6 +37,7 @@ from planner import (
     ReminderExecutionInstruction,
     SearchExecutionInstruction,
     SearchPlan,
+    _invoke_with_transient_retry,
     create_search_plan,
 )
 from scheduler import (
@@ -44,6 +45,7 @@ from scheduler import (
     ScheduledSearchJob,
     ScheduleValidationError,
     Scheduler,
+    _extract_content,
     console_print,
     format_jobs_table,
 )
@@ -67,10 +69,9 @@ MAX_AUTO_RUNS = config.MAX_AUTO_RUNS
 
 # ---- LLM ---------------------------------------------------------------------
 
-llm = ChatOpenAI(
-    model=config.LM_STUDIO_MODEL,
-    base_url=config.LM_STUDIO_BASE_URL,
-    api_key=config.LM_STUDIO_API_KEY,
+llm = ChatGoogleGenerativeAI(
+    model=config.GEMINI_MODEL,
+    google_api_key=config.GEMINI_API_KEY,
 )
 
 
@@ -210,7 +211,11 @@ def chat_node(state: ChatState):
         for m in messages
     )
     selected = scheduled_llm_with_tools if is_scheduled_run else llm_with_tools
-    return {"messages": [selected.invoke(messages)]}
+    return {
+        "messages": [
+            _invoke_with_transient_retry(lambda: selected.invoke(messages))
+        ]
+    }
 
 
 tool_node = ToolNode(tools)
@@ -436,7 +441,7 @@ def _run_one_off(user_input: str, plan: SearchPlan) -> None:
             ]
         }
     )
-    console_print(f"Assistant: {out['messages'][-1].content}")
+    console_print(f"Assistant: {_extract_content(out)}")
 
 
 def run_cli() -> None:

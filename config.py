@@ -1,9 +1,4 @@
-"""Centralized environment configuration for the HAKATHON chatbot.
-
-All env parsing lives here so `app.py` and `ragtool.py` share one source of truth.
-Blank env values are treated as unset. Numeric envs fall back to safe defaults
-when they cannot be parsed.
-"""
+"""Centralized environment configuration for the HAKATHON chatbot."""
 
 from __future__ import annotations
 
@@ -17,10 +12,24 @@ load_dotenv()
 
 # ---- Defaults -----------------------------------------------------------------
 
-DEFAULT_LM_STUDIO_MODEL = "qwen2.5-coder-7b-instruct"
-DEFAULT_LM_STUDIO_EMBEDDING_MODEL = "nomic-embed-text-v1.5"
-DEFAULT_LM_STUDIO_BASE_URL = "http://localhost:1234/v1"
-DEFAULT_LM_STUDIO_API_KEY = "lm-studio"
+DEFAULT_GEMINI_MODEL = "gemini-3.5-flash-lite"
+DEFAULT_GEMINI_EMBEDDING_MODEL = "gemini-embedding-001"
+_RETIRED_GEMINI_MODELS = {
+    "gemini-1.5-flash": "gemini-3.5-flash-lite",
+    "models/gemini-1.5-flash": "gemini-3.5-flash-lite",
+    "gemini-2.5-flash-lite": "gemini-3.5-flash-lite",
+    "models/gemini-2.5-flash-lite": "gemini-3.5-flash-lite",
+    "gemini-2.5-flash": "gemini-3.5-flash-lite",
+    "models/gemini-2.5-flash": "gemini-3.5-flash-lite",
+}
+# Google retired the `text-embedding-*` family (404 on the API) in favour of
+# the `gemini-embedding-*` lineup; map old names so RAG keeps working.
+_RETIRED_EMBEDDING_MODELS = {
+    "text-embedding-004": "gemini-embedding-001",
+    "models/text-embedding-004": "gemini-embedding-001",
+    "text-embedding-001": "gemini-embedding-001",
+    "models/text-embedding-001": "gemini-embedding-001",
+}
 DEFAULT_HTTP_TIMEOUT_SECONDS = 10.0
 DEFAULT_WAIT_MAX_SECONDS = 3600.0
 DEFAULT_MAX_AUTO_RUNS = 20
@@ -77,12 +86,29 @@ def env_path(name: str, default: Path) -> Path:
 
 # ---- Public config ------------------------------------------------------------
 
-LM_STUDIO_MODEL = env_str("LM_STUDIO_MODEL", DEFAULT_LM_STUDIO_MODEL)
-LM_STUDIO_EMBEDDING_MODEL = env_str(
-    "LM_STUDIO_EMBEDDING_MODEL", DEFAULT_LM_STUDIO_EMBEDDING_MODEL
+_legacy_lm_studio_model = env_str("LM_STUDIO_MODEL", "")
+_legacy_lm_studio_embedding_model = env_str("LM_STUDIO_EMBEDDING_MODEL", "")
+_legacy_lm_studio_api_key = env_str("LM_STUDIO_API_KEY", "")
+
+_configured_model = env_str("GEMINI_MODEL", _legacy_lm_studio_model or DEFAULT_GEMINI_MODEL)
+GEMINI_MODEL = _RETIRED_GEMINI_MODELS.get(_configured_model, _configured_model)
+_configured_embedding_model = env_str(
+    "GEMINI_EMBEDDING_MODEL",
+    _legacy_lm_studio_embedding_model or DEFAULT_GEMINI_EMBEDDING_MODEL,
 )
-LM_STUDIO_BASE_URL = env_str("LM_STUDIO_BASE_URL", DEFAULT_LM_STUDIO_BASE_URL)
-LM_STUDIO_API_KEY = env_str("LM_STUDIO_API_KEY", DEFAULT_LM_STUDIO_API_KEY)
+GEMINI_EMBEDDING_MODEL = _RETIRED_EMBEDDING_MODELS.get(
+    _configured_embedding_model, _configured_embedding_model
+)
+GEMINI_API_KEY = env_str(
+    "GEMINI_API_KEY",
+    env_str("GOOGLE_API_KEY", _legacy_lm_studio_api_key),
+)
+
+# Backward-compatible aliases for older imports.
+LM_STUDIO_MODEL = GEMINI_MODEL
+LM_STUDIO_EMBEDDING_MODEL = GEMINI_EMBEDDING_MODEL
+LM_STUDIO_API_KEY = GEMINI_API_KEY
+LM_STUDIO_BASE_URL = "Gemini API"
 ALPHAVANTAGE_API_KEY = env_str("ALPHAVANTAGE_API_KEY")
 HTTP_TIMEOUT_SECONDS = env_float("HTTP_TIMEOUT_SECONDS", DEFAULT_HTTP_TIMEOUT_SECONDS)
 WAIT_MAX_SECONDS = env_float("WAIT_MAX_SECONDS", DEFAULT_WAIT_MAX_SECONDS)
