@@ -58,7 +58,7 @@ class SearchPlan(BaseModel):
             "The kind of task this run performs. 'search' calls web_search "
             "(default). 'reminder' has no tool call — the LLM just writes a "
             "short reminder line. 'calculation' calls the calculator tool. "
-            "'rag' calls the Constitution PDF retrieval tool. 'chat' asks the "
+            "'rag' calls the user's active-document retrieval tool. 'chat' asks the "
             "LLM directly with no tool nudging."
         ),
     )
@@ -111,8 +111,9 @@ TASK TYPE — pick exactly one:
   Examples: 'remind me to drink water in 5 minutes', 'ping me tomorrow at 9am'.
   Populate reminder_text with the thing to remind them of (e.g. 'drink water').
 - 'calculation': pure arithmetic. Examples: 'calculate 2+2', '(3*4)+5'.
-- 'rag': the user is asking about the Constitution of India. Examples:
-  'what does the constitution say about free speech'.
+- 'rag': the user is asking about a document they uploaded (or about the
+  Constitution of India). Examples: 'what does the constitution say about free
+  speech', 'summarize my uploaded PDF'.
 - 'chat': the user wants a conversational answer that needs no external tool.
   Examples: 'tell me a joke', 'write a haiku about coffee'.
 - 'search': DEFAULT for anything that needs a web lookup (news, prices, facts,
@@ -616,13 +617,13 @@ class CalculationExecutionInstruction:
 
 @dataclass
 class RagExecutionInstruction:
-    """Instructs the LLM to route via the Constitution PDF retrieval tool."""
+    """Instructs the LLM to route via the active document retrieval tool."""
 
     query: str
 
     def render(self) -> str:
         return (
-            "This run asks about the Constitution of India. Use the get_rag_chunks "
+            "This run asks about the user's active document. Use the get_rag_chunks "
             f"tool with a query relevant to: {self.query!r}. Do not use web search."
         )
 

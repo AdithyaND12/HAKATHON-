@@ -138,8 +138,8 @@ arrow([(2065, 1810), (2270, 1810), (2270, 1970)], "no", (2100, 1778))
 # RAG detail callout
 section((70, 1915, 1260, 2040), "RAG TOOL DETAIL")
 draw.text((105, 1980),
-          "get_rag_chunks → Chroma index (if empty: load PDF → split text → embed/store)\n"
-          "→ similarity search top 4 → return Constitution chunks",
+          "get_rag_chunks → user-uploaded PDF's Chroma index\n"
+          "→ similarity search top 4 → return matching chunks",
           font=F_TINY, fill=INK)
 
 image.save("program_flowchart.png", optimize=True)

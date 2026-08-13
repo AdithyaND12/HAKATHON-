@@ -1,9 +1,10 @@
 # HAKATHON-
 
 An interactive LangGraph chatbot powered by Google Gemini.
-It combines web search, calculations, time lookup, stock prices, and retrieval from
-the Constitution of India PDF. It can also repeat searches on a robust background
-schedule while the CLI remains available for new requests.
+It combines web search, calculations, time lookup, stock prices, and RAG retrieval
+from PDFs the user uploads (each indexed into its own vector store). It can also
+repeat searches on a robust background schedule while the CLI remains available
+for new requests.
 
 ## What's new (scheduler v2)
 
@@ -21,8 +22,12 @@ The scheduling engine was rewritten to fix the pain points of the original:
   *"tomorrow 9am"*, or *"in 5 minutes"* are parsed and honored.
 - **Improved fallback planner** — recognises *hourly*, *daily*, *every day at X*,
   *twice*, *thrice*, *in N minutes*.
-- **Separate embedding model** — `GEMINI_EMBEDDING_MODEL` keeps Constitution RAG
-  aligned with a dedicated embedding model.
+- **Separate embedding model** — `JINA_EMBEDDING_MODEL` keeps RAG aligned with
+  Jina's free embedding API (`jina-embeddings-v4`, 1M free tokens/day); the
+  chat LLM remains Gemini.
+- **Embedding-swap safety** — index markers record the embedding model + PDF
+  hash, so switching embedding models automatically wipes and rebuilds any
+  incompatible (old-dimension) Chroma collections.
 
 ## Features
 
@@ -30,8 +35,8 @@ The scheduling engine was rewritten to fix the pain points of the original:
 - Web search via DuckDuckGo (wrapped with retry + backoff).
 - Calculator and current-time tools.
 - Alpha Vantage stock-price lookup with structured error taxonomy.
-- Constitution PDF retrieval using PyMuPDF, LangChain text splitting, a Gemini
-  embedding model, and Chroma.
+- Uploaded-PDF retrieval using PyMuPDF, LangChain text splitting, a Jina
+  embedding model, and Chroma — no built-in document; the user uploads the PDF.
 - Natural-language scheduling: *"check tesla news every 10 minutes for 5 times"*,
   *"search AI news at 3pm"*, *"monitor python news hourly"*.
 - Background scheduled jobs with cancellation, pause/resume, persistence, and
@@ -40,8 +45,8 @@ The scheduling engine was rewritten to fix the pain points of the original:
 ## Requirements
 
 - Python 3.10 or newer.
-- A Gemini API key.
-- A chat model **and** a separate embedding model available in Gemini.
+- A Gemini API key (chat model).
+- A Jina API key for the free embedding API (https://jina.ai/embeddings/).
 - An Alpha Vantage API key if stock-price lookups are required.
 
 ## Installation
@@ -74,9 +79,10 @@ cp .env.example .env
 | --- | --- | --- | --- |
 | `GEMINI_API_KEY` | Yes | — | Google Gemini API key. |
 | `GEMINI_MODEL` | Yes | `gemini-3.5-flash-lite` | Chat model. |
-| `GEMINI_EMBEDDING_MODEL` | For RAG | `gemini-embedding-001` | Embedding model for Constitution RAG. |
+| `JINA_API_KEY` | For RAG | — | Jina Embeddings API key (free tier: https://jina.ai/embeddings/). |
+| `JINA_EMBEDDING_MODEL` | No | `jina-embeddings-v4` | Free embedding model used for all RAG indexing + search. |
+| `JINA_EMBEDDING_BATCH_SIZE` | No | `100` | Chunks per embedding request (one POST per batch). |
 | `ALPHAVANTAGE_API_KEY` | For stocks | — | Alpha Vantage API key. |
-| `CONSTITUTION_PDF_PATH` | No | `pdfs/c9fe9c9b6840524844316f74bb1c556c.pdf` | PDF path (relative or absolute). |
 | `HTTP_TIMEOUT_SECONDS` | No | `10` | Timeout for stock API requests. |
 | `WAIT_MAX_SECONDS` | No | `3600` | Upper bound for a single `wait` / interval. |
 | `MAX_AUTO_RUNS` | No | `20` | Cap on the number of runs the planner can schedule. |
@@ -105,7 +111,7 @@ it in natural language.
 ```
 What are the latest technology headlines?
 Calculate 27 times 14.
-What does the Constitution say about freedom of speech?
+What does the Constitution say about freedom of speech? (with that PDF uploaded)
 What is the current price of AAPL?
 Check the latest Python news every 1 minute for 3 times.
 Monitor tesla stock hourly for 5 times.
@@ -135,12 +141,16 @@ Slash commands: `/help /jobs /cancel <id> /pause <id> /resume <id> /logs <id>
 - `.hakathon/history/<job-id>/run-NNN.json` — the assistant output for each run,
   timestamped.
 
-## Constitution retrieval
+## RAG document retrieval
 
-The first Constitution query indexes the configured PDF into the local
-`constitution_chroma_db/` directory. A `sha256` marker is written so re-indexing
-runs automatically whenever the PDF changes. `GEMINI_EMBEDDING_MODEL` should be a
-valid Gemini embedding model (default: `gemini-embedding-001`).
+There is no built-in document: the user uploads PDFs in the Streamlit sidebar,
+and each is indexed into its own hash-derived collection under
+`chroma_stores/<embedding-model>/` (e.g. `chroma_stores/jina-embeddings-v4/`).
+The LLM's `get_rag_chunks` tool queries whichever document is selected as active.
+A marker (embedding model + `sha256`) is written so re-indexing runs automatically
+whenever the PDF changes **or the embedding model changes** — old vectors from a
+different model are never reused, they are wiped and rebuilt. `JINA_API_KEY` must
+be set; the embedding model defaults to `jina-embeddings-v4`.
 
 ## Tests
 
@@ -162,20 +172,30 @@ config.py             Centralised env parsing
 planner.py            Search + schedule planner (LLM + regex fallback + absolute time)
 scheduler.py          Job registry, persistence, retries, pause/resume
 tools_search.py       DuckDuckGo tool with retry / backoff
-ragtool.py            Constitution PDF indexing + retrieval
+ragtool.py            User-uploaded PDF indexing + retrieval
 .streamlit/config.toml Dark theme config
 tests/                pytest suite
-pdfs/                  Default Constitution PDF
 .hakathon/            Runtime data (jobs.json, per-job history) — git-ignored
-constitution_chroma_db/  Vector store — git-ignored
+chroma_stores/       Vector stores (one dir per embedding model) — git-ignored
 ```
 
 ## Troubleshooting
 
 - **Gemini authentication error**: confirm `GEMINI_API_KEY` is set correctly in
   your `.env`.
-- **Constitution RAG embedding errors**: set `GEMINI_EMBEDDING_MODEL` to a valid
-  Gemini embedding model (the default is `gemini-embedding-001`).
+- **Embedding API error (RAG)**: confirm `JINA_API_KEY` is set correctly in your
+  `.env` (get a free key at https://jina.ai/embeddings/).
+- **Free-tier embedding limits**: the Jina free tier covers 1M tokens/day at
+  100 requests/minute, and `jina-embeddings-v4` is additionally throttled by
+  design. If a batch fails on rate limits the retry/backoff handles it; if your
+  day's tokens run out, indexing resumes automatically after the reset.
+- **Embedding model changed?** Nothing to do — stores are namespaced per
+  embedding model (`chroma_stores/<model>/`) and old-dimension vectors are
+  detected as incompatible and rebuilt automatically on next use.
+- **"Chroma collection not initialized"** — this happens when a Chroma store is
+  left in a broken state (e.g. an interrupted embedding-model switch). The app
+  now detects it, wipes the affected store, and rebuilds automatically. To
+  reset manually: stop the app and delete `chroma_stores/`.
 - **Stock lookup unavailable**: set `ALPHAVANTAGE_API_KEY` in `.env`; the rest of
   the chatbot remains usable without it.
 - **A schedule seems stuck**: run `/jobs` to see its state (`pending`, `running`,

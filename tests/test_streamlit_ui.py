@@ -44,6 +44,11 @@ def _stub_streamlit_and_load(tmp_path, monkeypatch):
     st.chat_input = lambda *a, **k: None
     st.warning = st.error = st.rerun = lambda *a, **k: None
     st.spinner = lambda *a, **k: _NullContext()
+    st.file_uploader = lambda *a, **k: None
+    st.selectbox = lambda *a, **k: None
+    st.progress = lambda *a, **k: _NullContext()
+    st.status = lambda *a, **k: _NullContext()
+    st.success = lambda *a, **k: None
     st.sidebar = _NullContext()
     sys.modules["streamlit"] = st
 

@@ -15,7 +15,9 @@ time you type.
 
 from __future__ import annotations
 
+import hashlib
 import json
+import re
 from datetime import datetime
 from pathlib import Path
 
@@ -44,6 +46,7 @@ except ImportError:  # pragma: no cover - only hit when the optional dep is miss
 
 # Reuse everything the CLI used.
 import config
+import ragtool
 from app import _build_messages, _registry, chatbot, scheduler
 from planner import SearchExecutionInstruction, SearchPlan, create_search_plan
 from scheduler import ScheduleValidationError, _extract_content
@@ -393,13 +396,17 @@ if _active_now or _grace_active:
 
 def _run_chatbot(prompt: str, plan: SearchPlan) -> str:
     """One-off invocation of the LangGraph chatbot (non-scheduled path)."""
+    system_messages: list[SystemMessage] = []
+    source_label = ragtool.active_source_label()
+    if source_label:
+        # Tell the LLM which uploaded document the RAG tool can see so it
+        # reaches for get_rag_chunks when the question targets that PDF.
+        system_messages.append(SystemMessage(content=source_label))
+    system_messages.append(
+        SystemMessage(content=SearchExecutionInstruction(plan.search_query).render())
+    )
     out = chatbot.invoke(
-        {
-            "messages": [
-                SystemMessage(content=SearchExecutionInstruction(plan.search_query).render()),
-                HumanMessage(content=prompt),
-            ]
-        }
+        {"messages": system_messages + [HumanMessage(content=prompt)]}
     )
     return _extract_content(out)
 
@@ -445,6 +452,41 @@ def _plan_summary_html(plan: SearchPlan) -> str:
     return " · ".join(parts)
 
 
+def _handle_pdf_upload(uploaded) -> None:
+    """Save an uploaded PDF to disk, index it, and make it the active RAG doc."""
+    data = uploaded.getvalue()
+    sha = hashlib.sha256(data).hexdigest()
+    if st.session_state.get("_pdf_upload_sha") == sha:
+        return  # same file re-offered on a rerun — already handled
+    st.session_state["_pdf_upload_sha"] = sha
+
+    uploads_dir = config.DATA_DIR / "uploads"
+    uploads_dir.mkdir(parents=True, exist_ok=True)
+    safe_name = re.sub(r"[^A-Za-z0-9._-]+", "_", uploaded.name or "document.pdf")
+    target = uploads_dir / f"{sha[:16]}_{safe_name}"
+    try:
+        target.write_bytes(data)
+    except OSError as exc:
+        st.error(f"Could not save upload: {exc}")
+        return
+
+    with st.status(f"indexing `{uploaded.name}`…", expanded=True) as status:
+        bar = st.progress(0.0, text="embedding chunks…")
+
+        def _report(done: int, total: int) -> None:
+            bar.progress(min(done / max(total, 1), 1.0))
+
+        try:
+            count = ragtool.index_pdf(target, progress=_report, name=uploaded.name)
+        except Exception as exc:  # noqa: BLE001
+            status.update(label="indexing failed", state="error")
+            st.error(f"Indexing failed: `{exc}`")
+            return
+        ragtool.set_active_collection(ragtool.collection_name_for_sha(sha))
+        status.update(label=f"indexed {count} chunks", state="complete")
+    st.rerun()
+
+
 # ---- Header ------------------------------------------------------------------
 
 st.markdown(
@@ -458,12 +500,12 @@ st.markdown(
 )
 
 
-# ---- Sidebar (minimal — just health + reset) ---------------------------------
+# ---- Sidebar (health, RAG documents, reset) ---------------------------------
 
 with st.sidebar:
     st.markdown("### session")
     st.caption(f"model: `{config.GEMINI_MODEL}`")
-    st.caption(f"embedding: `{config.GEMINI_EMBEDDING_MODEL}`")
+    st.caption(f"embedding: `{config.JINA_EMBEDDING_MODEL}`")
     active = _registry.active()
     st.caption(f"active schedules: **{len(active)}**")
     if active:
@@ -471,6 +513,49 @@ with st.sidebar:
             st.caption(
                 f"• `{job.id}` — {job.status} — {job.completed_runs}/{job.run_count or '?'}"
             )
+    st.divider()
+
+    # ---- RAG documents: pick the active one, upload new PDFs ----------------
+    st.markdown("### documents")
+    docs = ragtool.list_indexed_documents()
+    doc_options = [None] + [d["collection"] for d in docs]
+    doc_labels = {None: "no document"}
+    for doc in docs:
+        doc_labels[doc["collection"]] = f'{doc["name"]} · {doc["chunks"]} chunks'
+    current = ragtool.active_collection()
+    if current is None and docs:
+        # Nothing selected (e.g. fresh process after a restart): fall back to
+        # the most recently indexed document so RAG works immediately.
+        current = docs[0]["collection"]
+        ragtool.set_active_collection(current)
+    try:
+        picker_index = doc_options.index(current)
+    except ValueError:
+        picker_index = 0
+    picked = st.selectbox(
+        "RAG source",
+        options=doc_options,
+        index=picker_index,
+        format_func=lambda c: doc_labels.get(c, str(c)),
+        key="rag_source_picker",
+        help="The document the LLM's get_rag_chunks tool queries.",
+    )
+    if picked != current:
+        ragtool.set_active_collection(picked)
+        st.rerun()
+
+    uploaded = st.file_uploader("Upload a PDF to index", type=["pdf"], key="pdf_uploader")
+    if uploaded is not None:
+        _handle_pdf_upload(uploaded)
+
+    if st.button(
+        "remove active document",
+        use_container_width=True,
+        disabled=picked is None,
+    ):
+        ragtool.remove_indexed_document(picked)
+        st.rerun()
+
     st.divider()
     if st.button("clear chat", use_container_width=True):
         st.session_state.messages = []

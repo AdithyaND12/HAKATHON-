@@ -6,6 +6,7 @@ __pycache__/
 .pytest_cache/
 .DS_Store
 constitution_chroma_db/
+chroma_stores/
 tempCodeRunnerFile.python
 
 # Runtime data from the improved scheduler

@@ -6,7 +6,7 @@ This file is intentionally thin. All heavy logic lives in dedicated modules:
     planner.py        — search + schedule planner (LLM + regex fallback)
     scheduler.py      — background job registry, persistence, retries
     tools_search.py   — DuckDuckGo tool wrapped with retry/backoff
-    ragtool.py        — Constitution PDF RAG
+    ragtool.py        — user-uploaded PDF RAG
 
 Public names (`get_stock_price`, `run_scheduled_search`, `chatbot`,
 `ALPHAVANTAGE_API_KEY`, `HTTP_TIMEOUT_SECONDS`, `requests`) are re-exported here
@@ -50,7 +50,7 @@ from scheduler import (
     format_jobs_table,
 )
 from tools_search import search_tool
-from ragtool import retrieve_constitution_chunks
+from ragtool import retrieve_active_chunks
 
 load_dotenv()
 logging.basicConfig(level=logging.WARNING, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -170,13 +170,15 @@ def _stock_error(code: str, message: str) -> dict:
 
 @tool
 def get_rag_chunks(query: str) -> str:
-    """Retrieve chunks from the Constitution PDF that match the query.
+    """Retrieve relevant passages from the user's active RAG document.
 
-    Returns an explicit "no matches" message when the retriever finds nothing.
+    The active document is a PDF the user has uploaded and selected. Returns
+    an explicit "no matches" message when the retriever finds nothing, and a
+    prompt to upload a document when none is active.
     """
-    result = retrieve_constitution_chunks(query)
+    result = retrieve_active_chunks(query)
     if not result.strip():
-        return "No matching passages found in the Constitution PDF."
+        return "No matching passages found in the active document."
     return result
 
 
