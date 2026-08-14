@@ -86,6 +86,66 @@ def _ocr_page(page) -> str:
         return ""
 
 
+# ---- Heading-aware extraction -------------------------------------------------
+# PDFs usually have no machine-readable structure, but font sizes are a strong
+# heuristic: lines noticeably larger than the page's body text (or bold at body
+# size) are headings. Recording them lets the chunker keep sections intact and
+# attach a heading path to every chunk, which dramatically improves retrieval
+# for questions about named sections and gives the LLM a precise citation.
+
+_HEADING_SIZE_MULTIPLIER = 1.2  # size >= body * this -> a heading line
+_BOLD_FLAG = 2**4  # PyMuPDF span "flags" bit 4 means bold
+# Transient metadata key carrying heading candidates between page extraction
+# and chunking; never persisted to the vector store.
+_HEADINGS_META_KEY = "_headings"
+
+
+def _page_heading_candidates(page) -> list[tuple[int, str]]:
+    """Detect heading lines on a text-layer page as (level, text) pairs.
+
+    Body font size is the mode of span sizes weighted by text length. A line
+    is a heading when its size is >= 1.2x the body size, or when it is bold at
+    at least body size. Levels are relative ranks within the page: the largest
+    heading is level 1, smaller ones deeper. Returns [] for pages without a
+    text layer (scanned pages come back from OCR with no font information).
+    """
+    try:
+        data = page.get_text("dict")
+    except Exception:  # noqa: BLE001 - any extraction failure means no headings
+        return []
+
+    spans = [span for block in data.get("blocks", []) for line in block.get("lines", []) for span in line.get("spans", [])]
+    spans = [s for s in spans if s.get("text", "").strip()]
+    if not spans:
+        return []
+
+    weighted: dict[float, int] = {}
+    for span in spans:
+        weighted[span["size"]] = weighted.get(span["size"], 0) + len(span["text"])
+    body_size = max(weighted, key=weighted.get)
+
+    candidates: list[tuple[float, str]] = []
+    for line in data.get("blocks", []):
+        for l in line.get("lines", []):
+            spans = [s for s in l.get("spans", []) if s.get("text", "").strip()]
+            if not spans:
+                continue
+            size = max(s["size"] for s in spans)
+            bold = any(s["flags"] & _BOLD_FLAG for s in spans)
+            if size >= body_size * _HEADING_SIZE_MULTIPLIER or (bold and size >= body_size):
+                text = " ".join(s["text"].strip() for s in spans).strip()
+                if text:
+                    candidates.append((size, text))
+
+    levels: list[tuple[int, str]] = []
+    for rank, (_, text) in enumerate(sorted(candidates, key=lambda c: -c[0])):
+        levels.append((rank + 1, text))
+    # Restore document order (positions within the page).
+    positions = {text: idx for idx, (_, text) in enumerate(candidates)}
+    levels.sort(key=lambda pair: positions[pair[1]])
+    return levels
+
+
 def _load_pdf_pages_from(pdf_path: Path) -> list[Document]:
     if not pdf_path.is_file():
         raise FileNotFoundError(f"PDF not found at {pdf_path}.")
@@ -95,17 +155,16 @@ def _load_pdf_pages_from(pdf_path: Path) -> list[Document]:
     try:
         for page_number, page in enumerate(pdf):
             text = page.get_text("text")
+            headings = _page_heading_candidates(page) if text.strip() else []
             if not text.strip():
                 # Scanned PDF: no text layer, so recognize the page image.
                 text = _ocr_page(page)
                 ocr_used = ocr_used or bool(text.strip())
             if text.strip():
-                pages.append(
-                    Document(
-                        page_content=text,
-                        metadata={"source": str(pdf_path), "page": page_number},
-                    )
-                )
+                metadata: dict = {"source": str(pdf_path), "page": page_number}
+                if headings:
+                    metadata[_HEADINGS_META_KEY] = headings
+                pages.append(Document(page_content=text, metadata=metadata))
     finally:
         pdf.close()
     if ocr_used:
@@ -114,8 +173,32 @@ def _load_pdf_pages_from(pdf_path: Path) -> list[Document]:
 
 
 def _split_documents(documents: list[Document]) -> list[Document]:
+    """Split page documents into chunks, preserving heading context.
+
+    Heading candidates detected during page extraction are threaded through
+    the document in page order (standard outline algorithm: a heading of
+    level N closes every deeper heading). Each chunk records both the leaf
+    heading and the full heading path, so embedding/retrieval can place the
+    chunk in its section instead of a 500-char island.
+    """
     splitter = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=50)
-    return splitter.split_documents(documents)
+    chunks: list[Document] = []
+    chain: list[tuple[int, str]] = []
+    for document in documents:
+        headings = document.metadata.get(_HEADINGS_META_KEY, [])
+        for level, text in headings:
+            chain = [(l, h) for (l, h) in chain if l < level]
+            chain.append((level, text))
+        chunk_metadata = {
+            key: value for key, value in document.metadata.items() if key != _HEADINGS_META_KEY
+        }
+        for piece in splitter.split_text(document.page_content):
+            metadata = dict(chunk_metadata)
+            if chain:
+                metadata["heading"] = chain[-1][1]
+                metadata["heading_path"] = " > ".join(text for _, text in chain)
+            chunks.append(Document(page_content=piece, metadata=metadata))
+    return chunks
 
 
 def _get_embedding_model() -> JinaEmbeddings:
@@ -257,14 +340,21 @@ def _add_documents_with_retries(vectorstore: Chroma, documents: list[Document]) 
             time.sleep(wait)
 
 
+# Bump whenever chunking/contextualization changes the meaning of stored
+# vectors, so stale stores are rebuilt instead of served silently.
+INDEX_PIPELINE_VERSION = 2
+
+
 def _expected_marker(pdf_sha256: str) -> str:
-    """Marker content = embedding model + pdf hash.
+    """Marker content = embedding model + pipeline version + pdf hash.
 
     Including the model means switching embedding models (Gemini → Jina, or a
     future Jina model change) invalidates every old collection automatically,
-    since vectors from a different model/dimension are incompatible.
+    since vectors from a different model/dimension are incompatible. The
+    pipeline version additionally invalidates collections whose vectors were
+    produced by an older chunking/contextualization logic.
     """
-    return f"{JINA_EMBEDDING_MODEL}\n{pdf_sha256}"
+    return f"{JINA_EMBEDDING_MODEL}\n{INDEX_PIPELINE_VERSION}\n{pdf_sha256}"
 
 
 def _format_results(results: list[Document]) -> str:
@@ -273,15 +363,36 @@ def _format_results(results: list[Document]) -> str:
         page_num = document.metadata.get("page", "Unknown")
         if isinstance(page_num, int):
             page_num = page_num + 1
-        parts.append(
-            f"--- Result {index} ---\nPage: {page_num}\n{document.page_content.strip()}"
-        )
+        # Stored vectors carry a contextual prefix; show the raw passage and
+        # the section path instead so the LLM quotes clean text with citations.
+        content = document.metadata.get("raw_text") or document.page_content.strip()
+        header = f"--- Result {index} ---\nPage: {page_num}"
+        heading_path = document.metadata.get("heading_path")
+        if heading_path:
+            header += f"\nSection: {heading_path}"
+        parts.append(f"{header}\n{content}")
     return "\n\n".join(parts)
 
 
+# Fetch this many candidates over `k` for MMR diversity, since the top-k
+# cosine hits are often near-duplicate passages of one paragraph.
+MMR_FETCH_MULTIPLIER = 5
+
+
 def _retrieve_once(query: str, collection_name: str, k: int) -> str:
-    """Run one retrieval and format the results."""
-    results = _get_vectorstore(collection_name).similarity_search(query, k=k)
+    """Run one retrieval and format the results.
+
+    Uses Maximal Marginal Relevance so the k slots cover distinct passages
+    instead of several near-identical hits; falls back to plain similarity
+    search for stores without an MMR implementation.
+    """
+    vectorstore = _get_vectorstore(collection_name)
+    try:
+        results = vectorstore.max_marginal_relevance_search(
+            query, k=k, fetch_k=k * MMR_FETCH_MULTIPLIER
+        )
+    except AttributeError:  # pragma: no cover - langchain_chroma has MMR
+        results = vectorstore.similarity_search(query, k=k)
     return _format_results(results)
 
 
@@ -338,12 +449,36 @@ def _collection_is_current(
     return marker.read_text(encoding="utf-8").strip() == _expected_marker(pdf_sha256)
 
 
+def _contextualize_chunk(chunk: Document, doc_name: str) -> Document:
+    """Embed a chunk with its document/section context, display the raw text.
+
+    Contextual retrieval (Anthropic-style): the embedded text is prefixed
+    with ``[document > section]`` so semantically related passages that share
+    no words still co-locate; the raw passage is kept in metadata so retrieval
+    output stays clean and quotable.
+    """
+    context_parts = []
+    if doc_name:
+        context_parts.append(doc_name)
+    heading_path = chunk.metadata.get("heading_path")
+    if heading_path:
+        context_parts.append(heading_path)
+    raw_text = chunk.page_content.strip()
+    chunk.metadata["raw_text"] = raw_text
+    chunk.metadata["ctx_doc"] = doc_name
+    if context_parts:
+        chunk.page_content = f"[{' > '.join(context_parts)}]\n{raw_text}"
+    return chunk
+
+
 def _write_chunks(
     vectorstore: Chroma,
     chunks: list[Document],
     progress: Optional[Callable[[int, int], None]] = None,
+    doc_name: str = "",
 ) -> None:
     """Add all chunks in batches, reporting optional progress."""
+    chunks = [_contextualize_chunk(chunk, doc_name) for chunk in chunks]
     total = len(chunks)
     for start in range(0, total, EMBED_BATCH_SIZE):
         _add_documents_with_retries(vectorstore, chunks[start : start + EMBED_BATCH_SIZE])
@@ -396,6 +531,7 @@ def index_pdf(
             _prepare_collection(vectorstore, collection_name),
             chunks,
             progress=progress,
+            doc_name=name or path.name,
         )
     except Exception as exc:  # noqa: BLE001
         if not _is_persist_corruption_error(exc):
@@ -406,6 +542,7 @@ def index_pdf(
             _prepare_collection(_get_vectorstore(collection_name), collection_name),
             chunks,
             progress=progress,
+            doc_name=name or path.name,
         )
 
     PERSIST_DIRECTORY.mkdir(parents=True, exist_ok=True)

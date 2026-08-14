@@ -35,8 +35,9 @@ The scheduling engine was rewritten to fix the pain points of the original:
 - Web search via DuckDuckGo (wrapped with retry + backoff).
 - Calculator and current-time tools.
 - Alpha Vantage stock-price lookup with structured error taxonomy.
-- Uploaded-PDF retrieval using PyMuPDF, LangChain text splitting, a Jina
-  embedding model, and Chroma — no built-in document; the user uploads the PDF.
+- Uploaded-PDF RAG using PyMuPDF, OCR fallback, heading-aware chunking,
+  contextual retrieval, a Jina embedding model, and Chroma — no built-in
+  document; the user uploads the PDF.
 - Natural-language scheduling: *"check tesla news every 10 minutes for 5 times"*,
   *"search AI news at 3pm"*, *"monitor python news hourly"*.
 - Background scheduled jobs with cancellation, pause/resume, persistence, and
@@ -177,14 +178,55 @@ Slash commands: `/help /jobs /cancel <id> /pause <id> /resume <id> /logs <id>
 
 ## RAG document retrieval
 
-There is no built-in document: the user uploads PDFs in the Streamlit sidebar,
-and each is indexed into its own hash-derived collection under
-`chroma_stores/<embedding-model>/` (e.g. `chroma_stores/jina-embeddings-v4/`).
-The LLM's `get_rag_chunks` tool queries whichever document is selected as active.
-A marker (embedding model + `sha256`) is written so re-indexing runs automatically
-whenever the PDF changes **or the embedding model changes** — old vectors from a
-different model are never reused, they are wiped and rebuilt. `JINA_API_KEY` must
-be set; the embedding model defaults to `jina-embeddings-v4`.
+There is no built-in document: the user uploads PDFs (via the Streamlit sidebar
+or the FastAPI endpoints), and each is indexed into its own hash-derived Chroma
+collection under `chroma_stores/<embedding-model>/` (e.g.
+`chroma_stores/jina-embeddings-v4/`). The LLM's `get_rag_chunks` tool queries
+whichever document is selected as active — and that selection is persisted
+next to the store so it survives restarts. `JINA_API_KEY` must be set; the
+embedding model defaults to `jina-embeddings-v4` (free tier: 1M tokens/day).
+
+### Indexing pipeline
+
+- **Text extraction** — PyMuPDF pulls the native text layer; scanned
+  (image-only) pages fall back to tesseract OCR at 200 dpi.
+- **Heading-aware extraction** — font-size and bold heuristics detect section
+  headings on every page, so the chunker can keep the document outline intact.
+- **Section-aware chunking** — a recursive text splitter (500 chars, 50
+  overlap) records both the leaf `heading` and the full `heading_path`
+  (e.g. `Methods > Statistical Analysis`) on every chunk, improving retrieval
+  for questions about named sections and giving the model precise citations.
+- **Contextual retrieval** — chunks are embedded with a `[document > section]`
+  prefix so semantically related passages that share no words still co-locate;
+  the raw passage is kept in metadata so answers quote clean, readable text.
+- **MMR retrieval** — Maximal Marginal Relevance fetches `5 × k` candidates
+  and returns a *diverse* top-k instead of several near-duplicate hits.
+
+### Robustness and freshness
+
+- **Per-document isolation** — every PDF gets its own collection derived from
+  its sha256; re-indexing an unchanged file is skipped entirely.
+- **Stale-index invalidation** — every collection is stamped with an index
+  marker (embedding model + pipeline version + PDF hash). Switching the
+  embedding model or changing the chunking/contextualization logic
+  automatically wipes and rebuilds incompatible stores instead of silently
+  serving stale vectors.
+- **Embedding resilience** — batches (default 100 chunks per request) retry
+  with backoff on transient 429/5xx errors and fail fast when the provider's
+  daily quota is exhausted; indexing resumes automatically after the reset.
+- **Self-healing stores** — corrupt / half-written Chroma stores are detected
+  at query or index time, wiped, and rebuilt in place.
+- **Raw (no-embedding) mode** — RAG can be toggled off: the PDF is kept as-is
+  and its full text is handed to the model, so no chunking or embedding API
+  calls are made.
+
+### Integration
+
+- The planner classifies document questions as a `rag` task, and the
+  `get_rag_chunks` tool returns formatted passages (page + section header)
+  that the model must answer strictly from.
+- The FastAPI server exposes `POST /documents/upload`, `POST /documents/active`,
+  and `GET /documents` for upload/index, active-selection, and listing.
 
 ## Tests
 

@@ -50,6 +50,9 @@ class _FakeVectorstore:
     def similarity_search(self, query, k=4):
         return [Document(page_content="the clause about speech", metadata={"page": 3})]
 
+    def max_marginal_relevance_search(self, query, k=4, fetch_k=20):
+        return self.similarity_search(query, k=k)
+
     def delete_collection(self):
         self.deleted = True
 
@@ -222,7 +225,7 @@ def test_retrieve_active_chunks_queries_uploaded_collection(monkeypatch):
         def __init__(self, collection_name):
             seen.append(collection_name)
 
-        def similarity_search(self, query, k=4):
+        def max_marginal_relevance_search(self, query, k=4, fetch_k=20):
             return [Document(page_content="the clause about speech", metadata={"page": 3})]
 
     monkeypatch.setattr(ragtool, "_get_vectorstore", _Store)
@@ -274,6 +277,138 @@ def test_active_source_label_describes_uploaded_document(monkeypatch, tmp_path):
     finally:
         ragtool.set_active_collection(None)
     assert ragtool.active_source_label() is None
+
+
+# ---- Heading-aware chunking & contextual retrieval ---------------------------
+
+
+def test_split_documents_threads_heading_path_across_pages():
+    pages = [
+        Document(
+            page_content="page one " * 200,
+            metadata={"source": "d.pdf", "page": 0, ragtool._HEADINGS_META_KEY: [(1, "Overview")]},
+        ),
+        Document(
+            page_content="page two " * 200,
+            metadata={"source": "d.pdf", "page": 1, ragtool._HEADINGS_META_KEY: [(2, "Details")]},
+        ),
+    ]
+    chunks = ragtool._split_documents(pages)
+
+    assert all("heading" in c.metadata for c in chunks)
+    assert all(c.metadata["heading"] == "Overview" for c in chunks if c.metadata["page"] == 0)
+    assert all(
+        c.metadata["heading_path"] == "Overview > Details"
+        for c in chunks
+        if c.metadata["page"] == 1
+    )
+    assert all("_headings" not in c.metadata for c in chunks)
+
+
+def test_split_documents_closes_deeper_headings_on_new_sibling():
+    pages = [
+        Document(
+            page_content="page one " * 200,
+            metadata={"source": "d.pdf", "page": 0, ragtool._HEADINGS_META_KEY: [(1, "Overview")]},
+        ),
+        Document(
+            page_content="page two " * 200,
+            metadata={"source": "d.pdf", "page": 1, ragtool._HEADINGS_META_KEY: [(2, "History")]},
+        ),
+        Document(
+            page_content="page three " * 200,
+            metadata={"source": "d.pdf", "page": 2, ragtool._HEADINGS_META_KEY: [(2, "Recent Work")]},
+        ),
+    ]
+    chunks = ragtool._split_documents(pages)
+
+    # Heading paths accumulate in document order, so early chunks only know
+    # the headings seen so far, and a sibling heading closes deeper ones.
+    assert all(
+        c.metadata["heading_path"] == "Overview > History"
+        for c in chunks
+        if c.metadata["page"] == 1
+    )
+    assert all(
+        c.metadata["heading_path"] == "Overview > Recent Work"
+        for c in chunks
+        if c.metadata["page"] == 2
+    )
+
+
+def test_split_documents_without_headings_has_no_section_metadata():
+    pages = [Document(page_content="plain text " * 200, metadata={"source": "d.pdf", "page": 0})]
+    chunks = ragtool._split_documents(pages)
+
+    assert chunks
+    assert all("heading" not in c.metadata for c in chunks)
+
+
+def test_contextualize_chunk_prefixes_embedding_and_keeps_raw_text():
+    chunk = Document(
+        page_content="the actual passage",
+        metadata={"heading_path": "Overview > Details", "page": 2},
+    )
+
+    out = ragtool._contextualize_chunk(chunk, doc_name="contract.pdf")
+
+    assert out.page_content == "[contract.pdf > Overview > Details]\nthe actual passage"
+    assert out.metadata["raw_text"] == "the actual passage"
+
+
+def test_contextualize_chunk_without_context_keeps_text_unchanged():
+    chunk = Document(page_content="no headings here", metadata={"page": 0})
+
+    out = ragtool._contextualize_chunk(chunk, doc_name="")
+
+    assert out.page_content == "no headings here"
+    assert out.metadata["raw_text"] == "no headings here"
+
+
+def test_format_results_shows_raw_text_and_section():
+    chunk = Document(
+        page_content="[contract.pdf > Overview]\nthe real passage",
+        metadata={"raw_text": "the real passage", "heading_path": "Overview", "page": 2},
+    )
+
+    out = ragtool._format_results([chunk])
+
+    assert "Page: 3" in out
+    assert "Section: Overview" in out
+    assert "[contract.pdf" not in out
+    assert "the real passage" in out
+
+
+def test_format_results_falls_back_to_embedded_text():
+    chunk = Document(page_content="plain stored text", metadata={"page": 0})
+    out = ragtool._format_results([chunk])
+    assert "plain stored text" in out
+
+
+def test_retrieve_once_uses_mmr_for_diversity(monkeypatch):
+    class _MmrStore:
+        def __init__(self, collection_name):
+            self.calls = []
+
+        def max_marginal_relevance_search(self, query, k=4, fetch_k=20):
+            self.calls.append((query, k, fetch_k))
+            return [Document(page_content="chunk a", metadata={"page": 1})]
+
+    store = _MmrStore("x")
+    monkeypatch.setattr(ragtool, "_get_vectorstore", lambda collection_name: store)
+
+    out = ragtool._retrieve_once("speech", "rag_abc", 4)
+
+    assert store.calls == [("speech", 4, 20)]
+    assert "chunk a" in out
+
+
+def test_marker_includes_pipeline_version(monkeypatch):
+    monkeypatch.setattr(ragtool, "JINA_EMBEDDING_MODEL", "jina-embeddings-v4")
+    assert ragtool.INDEX_PIPELINE_VERSION >= 2
+    assert ragtool._expected_marker("a" * 64) == (
+        f"jina-embeddings-v4\n{ragtool.INDEX_PIPELINE_VERSION}\n{'a' * 64}"
+    )
 
 
 # ---- Embedding quota handling ------------------------------------------------
