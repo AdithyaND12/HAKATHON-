@@ -10,50 +10,67 @@ Run with:
     streamlit run streamlit_app.py
 
 Design: dark terminal aesthetic, monospace headers, minimal chrome.
+
 Scheduled runs still work — start one from chat ("search AI news every 10 min
-for 3 times") and completed runs are surfaced back into the chat the next
-time you type.
+for 3 times") and completed runs are surfaced back into the chat. A
+background `@st.fragment` poller (instead of full-app auto-refresh) picks up
+completed runs every few seconds while jobs are active, without redrawing the
+whole page on every tick.
+
+Improvements over the original UI:
+
+* Multi-turn memory — prior turns are fed to the LLM (budget-trimmed).
+* Streaming responses — tokens render as they arrive, with a token counter.
+* Thread- and process-safe conversation persistence (file locking).
+* Friendly errors — details go to the log, not the chat.
+* LLM-generated chat titles and markdown/JSON export.
 """
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
+import logging
 import os
 import re
+import threading
 import uuid
 from datetime import datetime
 from pathlib import Path
 
 import streamlit as st
-from langchain_core.messages import HumanMessage, SystemMessage
+from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage
 
 try:
     from streamlit_autorefresh import st_autorefresh
 except ImportError:  # pragma: no cover - only hit when the optional dep is missing
     def st_autorefresh(**kwargs):  # type: ignore[no-redef]
-        """Fallback stub used when `streamlit-autorefresh` is not installed.
+        """Inert compat stub.
 
-        The app still works — scheduled runs won't appear until the user types
-        or clicks something. Fix by running: `pip install streamlit-autorefresh`.
+        The UI no longer uses `streamlit-autorefresh` — background polling is
+        handled by a `@st.fragment(run_every=...)` declared only while jobs are
+        active. The stub is kept so older imports (and tests) keep working.
         """
-        st.session_state.setdefault("_autorefresh_missing_warned", False)
-        if not st.session_state["_autorefresh_missing_warned"]:
-            st.warning(
-                "`streamlit-autorefresh` is not installed. Scheduled runs will "
-                "only appear after your next interaction. Install it with "
-                "`pip install streamlit-autorefresh` for automatic updates.",
-                icon="⚠️",
-            )
-            st.session_state["_autorefresh_missing_warned"] = True
         return 0
 
 # Reuse everything the CLI used.
 import config
 import ragtool
-from app import _build_messages, _registry, chatbot, scheduler, set_chatbot_model
+from app import _registry, chatbot, llm, scheduler, set_chatbot_model
 from planner import SearchExecutionInstruction, SearchPlan, create_search_plan
-from scheduler import ScheduleValidationError, _extract_content
+from scheduler import (
+    ScheduleValidationError,
+    _content_to_text,
+    _extract_content,
+)
+
+log = logging.getLogger(__name__)
+
+# Budget for feeding prior turns back to the LLM: newest-first, capped by both
+# message count and total characters so long chats can't blow the context window.
+HISTORY_MAX_MESSAGES = 20
+HISTORY_MAX_CHARS = 24_000
 
 
 # ---- Page config -------------------------------------------------------------
@@ -359,6 +376,60 @@ def _conversations_path() -> Path:
     return config.DATA_DIR / "conversations.json"
 
 
+# Serializes access to the conversations sidecar: an in-process re-entrant
+# thread lock plus an OS advisory lock (fcntl), so concurrent tabs *and*
+# concurrent Streamlit processes can't clobber each other's read-modify-write
+# cycles. RLock (not Lock) so a read under a held store lock can't deadlock.
+_CONVERSATIONS_LOCK = threading.RLock()
+_STORE_LOCK_PATH = None
+# Set while this process holds the POSIX advisory lock. flock locks conflict
+# even between two file descriptors in the SAME process, so the fcntl lock is
+# taken only once per process (outermost reader/writer); the RLock above covers
+# re-entrant nested reads/writes within the process.
+_STORE_LOCK_HELD = False
+
+
+def _store_lock_path() -> Path:
+    global _STORE_LOCK_PATH
+    if _STORE_LOCK_PATH is None:
+        _STORE_LOCK_PATH = _conversations_path().with_suffix(".json.lock")
+    return _STORE_LOCK_PATH
+
+
+@contextlib.contextmanager
+def _store_lock() -> "contextlib.AbstractContextManager[None]":
+    """Acquire the store lock (in-process re-entrant lock + a single POSIX
+    advisory lock per process, where available). Falls back to the in-process
+    lock on non-POSIX platforms."""
+    global _STORE_LOCK_HELD
+    _CONVERSATIONS_LOCK.acquire()
+    lock_file = None
+    try:
+        if not _STORE_LOCK_HELD:
+            try:
+                import fcntl  # POSIX only.
+
+                lock_file = open(_store_lock_path(), "w", encoding="utf-8")
+                fcntl.flock(lock_file, fcntl.LOCK_EX)
+                _STORE_LOCK_HELD = True
+            except (ImportError, OSError):  # pragma: no cover - non-POSIX fallback
+                if lock_file is not None:
+                    lock_file.close()
+                lock_file = None
+        yield
+    finally:
+        if lock_file is not None:
+            _STORE_LOCK_HELD = False
+            try:
+                import fcntl
+
+                fcntl.flock(lock_file, fcntl.LOCK_UN)
+            except (ImportError, OSError):  # pragma: no cover
+                pass
+            lock_file.close()
+        _CONVERSATIONS_LOCK.release()
+
+
 def _load_conversations() -> dict:
     """Read persisted conversations (conversations + active id + job routing)."""
     empty = {"conversations": {}, "active_conv": None, "job_conv": {}}
@@ -366,7 +437,8 @@ def _load_conversations() -> dict:
     if not path.is_file():
         return empty
     try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
+        with _store_lock():
+            payload = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError):  # noqa: S110 - corrupt sidecar, start fresh
         return empty
     if not isinstance(payload, dict):
@@ -385,20 +457,21 @@ def _persist_conversations(conversations: dict, active_conv: "str | None", job_c
         config.DATA_DIR.mkdir(parents=True, exist_ok=True)
         path = _conversations_path()
         tmp = path.with_suffix(".json.tmp")
-        tmp.write_text(
-            json.dumps(
-                {
-                    "conversations": conversations,
-                    "active_conv": active_conv,
-                    "job_conv": job_conv,
-                },
-                indent=2,
-            ),
-            encoding="utf-8",
-        )
-        os.replace(tmp, path)
+        with _store_lock():
+            tmp.write_text(
+                json.dumps(
+                    {
+                        "conversations": conversations,
+                        "active_conv": active_conv,
+                        "job_conv": job_conv,
+                    },
+                    indent=2,
+                ),
+                encoding="utf-8",
+            )
+            os.replace(tmp, path)
     except OSError:  # noqa: S110 - persistence is best-effort
-        pass
+        log.exception("Could not persist conversations to %s", path if "path" in locals() else "?")
 
 
 def _create_conversation(conversations: dict) -> str:
@@ -415,6 +488,18 @@ def _conversation_title(messages: list[dict]) -> str:
             title = " ".join(str(message.get("content", "")).split())
             return (title[:30] + "…") if len(title) > 30 else (title or "new chat")
     return "new chat"
+
+
+def _conversation_to_markdown(messages: list[dict]) -> str:
+    """Render a conversation as plain markdown for export/download."""
+    lines: list[str] = [f"# {_conversation_title(messages)}", ""]
+    for message in messages:
+        role = message.get("role", "?")
+        content = str(message.get("content", ""))
+        if message.get("kind") == "scheduled_run":
+            content = re.sub(r"<[^>]+>", "", content)  # strip card HTML
+        lines.append(f"## {role}\n\n{content}\n")
+    return "\n".join(lines)
 
 
 def _route_scheduled_run(job_id: str, conversations: dict, job_conv: dict) -> "str | None":
@@ -472,12 +557,14 @@ if "resumed_once" not in st.session_state:
         pass
 
 
-# ---- Auto-refresh ------------------------------------------------------------
-# Streamlit only reruns on user interaction, so background scheduled runs would
-# never surface unless the user typed something. When there are active schedules
-# in the registry, poll every few seconds so completed runs appear on their own.
-# We also poll for a short grace window after the *last* active job finishes
-# so the final run(s) can flush into the chat.
+# ---- Live scheduled-run polling ------------------------------------------------
+# Streamlit only reruns on interaction, so background scheduled runs would never
+# surface on their own. A fragment with `run_every` polls in the background and
+# appends newly-completed runs to a container created *outside* the fragment —
+# Streamlit accumulates those elements across fragment reruns, so the rest of
+# the page (chat history) is NOT redrawn on every poll tick. The fragment is
+# declared lazily at the bottom of the script, so it exists only while a job is
+# active (or within the short post-job grace window).
 
 _active_now = _registry.active()
 if _active_now:
@@ -488,18 +575,108 @@ _last_seen = st.session_state.get("_last_active_at")
 if _last_seen and (datetime.now().timestamp() - _last_seen) < 15:
     _grace_active = True
 
-if _active_now or _grace_active:
-    # Interval in milliseconds. Every tick triggers a full script rerun, which
-    # re-executes `_fetch_new_scheduled_runs()` below and picks up new files
-    # written by the scheduler's daemon threads.
-    st_autorefresh(interval=3000, key="poll_history")
+
+def _render_live_runs_in(runs: list[dict], render_fn) -> bool:
+    """Append scheduled-run cards for `runs` via `render_fn` (a callable like
+    `container.markdown` or `st.markdown`). Returns True when at least one card
+    was appended (i.e. user-visible work happened on this tick)."""
+    appended = False
+    for run in runs:
+        card_html = _render_scheduled_run_card(run)
+        target = _route_scheduled_run(
+            run["job_id"], st.session_state.conversations, st.session_state.job_conv
+        )
+        if target is None:
+            continue
+        st.session_state.conversations[target]["messages"].append(
+            {
+                "role": "assistant",
+                "kind": "scheduled_run",
+                "content": card_html,
+            }
+        )
+        if target == st.session_state.active_conv:
+            render_fn(card_html, unsafe_allow_html=True)
+            appended = True
+    if runs:
+        _persist_conversations(
+            st.session_state.conversations,
+            st.session_state.active_conv,
+            st.session_state.job_conv,
+        )
+    return appended
+
+
+@st.fragment(run_every="3s")
+def _poll_scheduled_runs(live_container) -> None:
+    """Background poller: surfaces completed scheduled runs while any job is
+    active (or within the post-job grace window).
+
+    Runs as its own fragment so the full app is NOT rerun every interval. When
+    polling is no longer needed it triggers an app rerun so the main script can
+    stop declaring it (a fragment can't un-declare itself).
+    """
+    job_count = len(_registry.active())
+    if job_count:
+        st.session_state["_last_active_at"] = datetime.now().timestamp()
+
+    new_runs = _fetch_new_scheduled_runs()
+    if new_runs:
+        _render_live_runs_in(new_runs, live_container.markdown)
+
+    # No active jobs and past the grace window: tear the poller down via an app
+    # rerun. The main script will see stale `_last_active_at` and not re-declare
+    # the fragment.
+    if not job_count and (
+        datetime.now().timestamp()
+        - st.session_state.get("_last_active_at", 0.0)
+        > 15
+    ):
+        st.rerun()
 
 
 # ---- Helpers -----------------------------------------------------------------
 
 
-def _run_chatbot(prompt: str, plan: SearchPlan) -> str:
-    """One-off invocation of the LangGraph chatbot (non-scheduled path)."""
+# ---- LLM message construction --------------------------------------------------
+
+
+def _history_to_langchain(messages: list[dict]) -> list[BaseMessage]:
+    """Convert the persisted chat history to LangChain messages for the LLM.
+
+    Scheduled-run cards (raw HTML) and empty entries are skipped. The newest
+    messages are kept first, subject to `HISTORY_MAX_MESSAGES` / `HISTORY_MAX_CHARS`
+    budgets, so long chats are trimmed instead of overflowing the context window.
+    """
+    kept: list[BaseMessage] = []
+    used = 0
+    for message in reversed(messages):
+        if message.get("kind") == "scheduled_run":
+            continue
+        role = message.get("role")
+        content = message.get("content")
+        if role not in ("user", "assistant") or not content:
+            continue
+        if len(kept) >= HISTORY_MAX_MESSAGES:
+            break
+        content = str(content)
+        if used + len(content) > HISTORY_MAX_CHARS:
+            remaining = HISTORY_MAX_CHARS - used
+            if remaining <= 0:
+                break
+            content = content[:remaining]
+        used += len(content)
+        kept.append(
+            (HumanMessage if role == "user" else AIMessage)(content=content)
+        )
+    kept.reverse()
+    return kept
+
+
+def _build_llm_messages(prompt: str, plan: SearchPlan, history: list[dict]) -> list[SystemMessage]:
+    """Assemble the full message list for one chatbot invocation: system context
+    (RAG source label or raw document, plus the planner's search instruction),
+    the trimmed prior conversation, then the user's current prompt."""
     system_messages: list[SystemMessage] = []
     if st.session_state.get("rag_mode", True):
         # RAG on: tell the LLM which uploaded document the RAG tool can see so
@@ -524,10 +701,83 @@ def _run_chatbot(prompt: str, plan: SearchPlan) -> str:
     system_messages.append(
         SystemMessage(content=SearchExecutionInstruction(plan.search_query).render())
     )
-    out = chatbot.invoke(
-        {"messages": system_messages + [HumanMessage(content=prompt)]}
-    )
+    return system_messages + _history_to_langchain(history) + [HumanMessage(content=prompt)]
+
+
+def _run_chatbot(prompt: str, plan: SearchPlan, history: list[dict]) -> str:
+    """One-off invocation of the LangGraph chatbot (non-streaming fallback)."""
+    out = chatbot.invoke({"messages": _build_llm_messages(prompt, plan, history)})
     return _extract_content(out)
+
+
+def _stream_chatbot(prompt: str, plan: SearchPlan, history: list[dict]):
+    """Stream the chatbot's reply token by token from the LangGraph graph.
+
+    Yields `(text_chunk, usage_metadata | None)` pairs. If the graph or model
+    cannot stream (network hiccup, unsupported mode), falls back to a single
+    non-streamed invocation and yields the whole reply as one chunk.
+    """
+    inputs = {"messages": _build_llm_messages(prompt, plan, history)}
+    try:
+        saw_chunk = False
+        for chunk, _metadata in chatbot.stream(inputs, stream_mode="messages"):
+            saw_chunk = True
+            text = _content_to_text(getattr(chunk, "content", ""))
+            usage = getattr(chunk, "usage_metadata", None) or None
+            if text or usage:
+                yield text, usage
+        if not saw_chunk:
+            log.warning("Streaming produced no chunks for %r; using invoke()", prompt)
+            yield _run_chatbot(prompt, plan, history), None
+    except Exception:  # noqa: BLE001 - degraded, not fatal
+        log.exception("Streaming failed for prompt %r; falling back to invoke()", prompt)
+        yield _run_chatbot(prompt, plan, history), None
+
+
+def _auto_title_conversation(history: list[dict], current_title: str) -> str:
+    """Ask the LLM for a short conversation title; best-effort and never fatal.
+
+    Falls back to `current_title` when the call fails or the model refuses to
+    produce a usable title.
+    """
+    user_text = " / ".join(
+        " ".join(str(m.get("content", "")).split())[:300]
+        for m in history
+        if m.get("role") == "user" and m.get("content")
+    )[:2000]
+    if not user_text:
+        return current_title
+    try:
+        out = llm.invoke(
+            [
+                SystemMessage(
+                    content=(
+                        "You invent short chat titles. Reply with ONLY the "
+                        "title: 2-5 words, no punctuation, no quotes, no newlines."
+                    )
+                ),
+                HumanMessage(content=f"Conversation so far:\n{user_text}\n\nTitle:"),
+            ]
+        )
+        # llm.invoke returns a BaseMessage; normalize to plain text.
+        raw = getattr(out, "content", None)
+        if raw is None:
+            raw = _extract_content(out)
+        title = " ".join(_content_to_text(raw).split())
+        title = title.strip('"\'“”.,').strip()
+        if title and len(title) <= 40:
+            return title
+    except Exception:  # noqa: BLE001 - auto-titling is optional
+        log.exception("Auto-title generation failed; keeping %r", current_title)
+    return current_title
+
+
+def _user_friendly_error(exc: Exception) -> str:
+    """Render a user-safe error line; the full traceback goes to the log."""
+    return (
+        f"⚠️ The model call failed (`{type(exc).__name__}`). Check your Gemini "
+        "API key and quota, then try again. Details were logged."
+    )
 
 
 def _fetch_new_scheduled_runs() -> list[dict]:
@@ -598,9 +848,12 @@ def _handle_pdf_upload(uploaded, *, index: bool) -> None:
 
             try:
                 count = ragtool.index_pdf(target, progress=_report, name=uploaded.name)
-            except Exception as exc:  # noqa: BLE001
+            except Exception:  # noqa: BLE001
+                log.exception("PDF indexing failed for %s", target)
                 status.update(label="indexing failed", state="error")
-                st.error(f"Indexing failed: `{exc}`")
+                st.error(
+                    "Indexing failed — check the Jina API key / quota. Details were logged."
+                )
                 return
             ragtool.set_active_collection(ragtool.collection_name_for_sha(sha))
             status.update(label=f"indexed {count} chunks", state="complete")
@@ -608,9 +861,10 @@ def _handle_pdf_upload(uploaded, *, index: bool) -> None:
         with st.status(f"reading `{uploaded.name}`…", expanded=True) as status:
             try:
                 meta = ragtool.store_raw_pdf(target, name=uploaded.name)
-            except Exception as exc:  # noqa: BLE001
+            except Exception:  # noqa: BLE001
+                log.exception("Raw PDF read failed for %s", target)
                 status.update(label="reading failed", state="error")
-                st.error(f"Could not read PDF: `{exc}`")
+                st.error("Could not read PDF — is it a valid file? Details were logged.")
                 return
             status.update(
                 label=f"stored {meta['pages']} pages · no chunking, no embeddings",
@@ -705,11 +959,13 @@ with st.sidebar:
         index=model_labels.index(default_label),
         key="model_picker",
     )
-    if picked_model and picked_model != st.session_state.get("_active_model_label"):
+    # `app.llm` already uses config.GEMINI_MODEL at import, so the first run
+    # must NOT rebuild it — only rebuild when the user actively switches models.
+    if "_active_model_label" not in st.session_state:
+        st.session_state["_active_model_label"] = picked_model
+    elif picked_model != st.session_state["_active_model_label"]:
         set_chatbot_model(config.GEMINI_MODEL_OPTIONS[picked_model])
         st.session_state["_active_model_label"] = picked_model
-    else:
-        st.session_state.setdefault("_active_model_label", default_label)
     st.caption(f"active: **{st.session_state['_active_model_label']}**")
     if st.session_state.get("rag_mode", True):
         st.caption(f"embedding: `{config.JINA_EMBEDDING_MODEL}`")
@@ -802,6 +1058,30 @@ with st.sidebar:
             st.rerun()
 
     st.divider()
+    _active_chat_for_export = st.session_state.conversations[st.session_state.active_conv]
+    st.download_button(
+        "export chat (.md)",
+        data=_conversation_to_markdown(_active_chat_for_export["messages"]),
+        file_name=f'chat-{st.session_state.active_conv}.md',
+        mime="text/markdown",
+        use_container_width=True,
+        key=f"export_md_{st.session_state.active_conv}",
+    )
+    st.download_button(
+        "export chat (.json)",
+        data=json.dumps(
+            {
+                "title": _active_chat_for_export.get("title", "new chat"),
+                "messages": _active_chat_for_export["messages"],
+            },
+            indent=2,
+        ),
+        file_name=f'chat-{st.session_state.active_conv}.json',
+        mime="application/json",
+        use_container_width=True,
+        key=f"export_json_{st.session_state.active_conv}",
+    )
+    st.divider()
     if st.button("clear chat", use_container_width=True):
         chat = st.session_state.conversations[st.session_state.active_conv]
         chat["messages"] = []
@@ -827,9 +1107,22 @@ for message in active_chat["messages"]:
     # regular chat bubbles as plain st.markdown so they get the bubble style.
     if role == "assistant" and message.get("kind") == "scheduled_run":
         st.markdown(message["content"], unsafe_allow_html=True)
-    else:
-        with st.chat_message(role):
-            st.markdown(message["content"])
+        continue
+    with st.chat_message(role):
+        st.markdown(message["content"])
+        usage = message.get("usage") if isinstance(message.get("usage"), dict) else None
+        if usage:
+            # Gemini reports usage_metadata on the final chunk; show a subtle
+            # token count under the reply as a session-visibility aid.
+            tokens_in = usage.get("input_tokens")
+            tokens_out = usage.get("output_tokens")
+            if tokens_in is not None or tokens_out is not None:
+                parts = []
+                if tokens_in is not None:
+                    parts.append(f"in {tokens_in:,}")
+                if tokens_out is not None:
+                    parts.append(f"out {tokens_out:,}")
+                st.caption(" · ".join(parts) + " tokens")
 
 
 # ---- Active schedules status strip ------------------------------------------
@@ -911,39 +1204,30 @@ def _markdown_to_html(text: str) -> str:
 
 
 new_runs = _fetch_new_scheduled_runs()
-for run in new_runs:
-    card_html = _render_scheduled_run_card(run)
-    target = _route_scheduled_run(
-        run["job_id"], st.session_state.conversations, st.session_state.job_conv
-    )
-    if target is None:
-        continue
-    st.session_state.conversations[target]["messages"].append(
-        {
-            "role": "assistant",
-            "kind": "scheduled_run",
-            "content": card_html,
-        }
-    )
-    if target == st.session_state.active_conv:
-        st.markdown(card_html, unsafe_allow_html=True)
 if new_runs:
-    _persist_conversations(
-        st.session_state.conversations,
-        st.session_state.active_conv,
-        st.session_state.job_conv,
-    )
+    # Render completed runs as inline cards in the chat flow. Runs completed
+    # *while the page is idle* are handled by the background poller instead.
+    _render_live_runs_in(new_runs, st.markdown)
 
 
 # ---- Chat input --------------------------------------------------------------
+
+# Declare the background poller only while a job is active (or within the grace
+# window). The container is created here — below the history — so live cards
+# accumulate at the bottom of the page, above the input.
+if _active_now or _grace_active:
+    _live_container = st.container()
+    _poll_scheduled_runs(_live_container)
 
 prompt = st.chat_input("ask anything · try 'search AI news every 5 min for 3 times'")
 
 if prompt:
     # Show the user's message immediately in the active conversation.
     active_chat = st.session_state.conversations[st.session_state.active_conv]
+    history_before = list(active_chat["messages"])
     active_chat["messages"].append({"role": "user", "content": prompt})
-    if active_chat["title"] == "new chat":
+    auto_title_pending = active_chat["title"] == "new chat"
+    if auto_title_pending:
         active_chat["title"] = _conversation_title(active_chat["messages"])
     with st.chat_message("user"):
         st.markdown(prompt)
@@ -951,14 +1235,15 @@ if prompt:
     # Plan the request (chooses schedule vs. one-off).
     try:
         plan = create_search_plan(prompt)
-    except Exception as exc:  # noqa: BLE001
+    except Exception:  # noqa: BLE001
+        log.exception("Planner failed for prompt %r", prompt)
         plan = SearchPlan(
             search_query=prompt,
             should_schedule=False,
             wait_minutes=0.0,
             run_count=1,
         )
-        st.warning(f"Planner error: {exc}. Falling back to a single run.")
+        st.warning("Planner error — falling back to a single run. Details logged.")
 
     with st.chat_message("assistant"):
         # Show planner summary as a subtle line above the answer.
@@ -1000,11 +1285,12 @@ if prompt:
                     st.session_state.active_conv,
                     st.session_state.job_conv,
                 )
-                # Force a rerun so the auto-refresh block at the top of the
-                # script picks up the new active schedule and starts polling.
+                # Force a rerun so the polling block at the top of the script
+                # picks up the new active schedule and starts the poller.
                 st.rerun()
             except ScheduleValidationError as exc:
-                err = f"Invalid schedule: {exc}"
+                log.warning("Invalid schedule from planner: %s", exc)
+                err = "Invalid schedule — check the phrasing (e.g. `every 5 min for 3 times`)."
                 st.error(err)
                 active_chat["messages"].append({"role": "assistant", "content": err})
                 _persist_conversations(
@@ -1013,15 +1299,57 @@ if prompt:
                     st.session_state.job_conv,
                 )
         else:
-            with st.spinner("thinking..."):
-                try:
-                    reply = _run_chatbot(prompt, plan)
-                except Exception as exc:  # noqa: BLE001
-                    reply = f"⚠️ Error talking to Gemini: `{exc}`"
-            st.markdown(reply)
-            active_chat["messages"].append({"role": "assistant", "content": reply})
+            # Stream the reply token by token; capture usage metadata from the
+            # final chunk so we can show a per-message token count.
+            placeholder = st.empty()
+            chunks: list[str] = []
+            usage: dict | None = None
+            try:
+                for text_chunk, chunk_usage in _stream_chatbot(prompt, plan, history_before):
+                    if text_chunk:
+                        chunks.append(text_chunk)
+                        placeholder.markdown("".join(chunks))
+                    if chunk_usage:
+                        usage = chunk_usage
+            except Exception as exc:  # noqa: BLE001
+                log.exception("Chatbot invocation failed for prompt %r", prompt)
+                chunks = [_user_friendly_error(exc)]
+                usage = None
+            reply = "".join(chunks).strip()
+            if not reply:
+                reply = "_(no response — the model returned nothing; details logged)_"
+            placeholder.markdown(reply)
+            if usage:
+                st.caption(
+                    " · ".join(
+                        p
+                        for p in (
+                            f"in {usage.get('input_tokens'):,}" if usage.get("input_tokens") is not None else "",
+                            f"out {usage.get('output_tokens'):,}" if usage.get("output_tokens") is not None else "",
+                        )
+                        if p
+                    )
+                    + " tokens"
+                )
+            message_entry: dict = {"role": "assistant", "content": reply}
+            if usage:
+                message_entry["usage"] = usage
+            active_chat["messages"].append(message_entry)
             _persist_conversations(
                 st.session_state.conversations,
                 st.session_state.active_conv,
                 st.session_state.job_conv,
             )
+            # Best-effort LLM title for a brand-new chat (replaces the
+            # truncated first-message fallback).
+            if auto_title_pending and reply and not reply.startswith("⚠️"):
+                better_title = _auto_title_conversation(
+                    active_chat["messages"], active_chat["title"]
+                )
+                if better_title and better_title != active_chat["title"]:
+                    active_chat["title"] = better_title
+                    _persist_conversations(
+                        st.session_state.conversations,
+                        st.session_state.active_conv,
+                        st.session_state.job_conv,
+                    )

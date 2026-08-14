@@ -46,6 +46,9 @@ def _stub_streamlit_and_load(tmp_path, monkeypatch):
     st.spinner = lambda *a, **k: _NullContext()
     st.file_uploader = lambda *a, **k: None
     st.selectbox = lambda *a, **k: None
+    st.download_button = lambda *a, **k: None
+    st.container = lambda *a, **k: _NullContext()
+    st.fragment = lambda *a, **k: (lambda f: f)  # re-declared lazily per call
 
     def _radio(*a, **k):
         """Mimic Streamlit: a keyed radio returns its stored value, otherwise
@@ -270,3 +273,146 @@ def test_conversations_persist_roundtrip(tmp_path, monkeypatch):
     # A corrupt file must not crash loading — start fresh.
     app_mod._conversations_path().write_text("{not json", encoding="utf-8")
     assert app_mod._load_conversations()["conversations"] == {}
+
+
+def test_conversation_lock_is_shared_locked_file(tmp_path, monkeypatch):
+    """Lock and persist use the same lock file beside the conversations store."""
+    app_mod, _ = _stub_streamlit_and_load(tmp_path, monkeypatch)
+    assert app_mod._store_lock_path() == app_mod._conversations_path().with_suffix(".json.lock")
+    assert not app_mod._store_lock_path().exists()
+    # Persist under the lock writes the store fine and leaves a lock file.
+    app_mod._persist_conversations({"c1": {"title": "t", "messages": []}}, "c1", {})
+    assert app_mod._conversations_path().is_file()
+    assert app_mod._store_lock_path().exists()
+    # Re-entrant use (load view) must not deadlock.
+    with app_mod._store_lock():
+        loaded = app_mod._load_conversations()
+    assert "c1" in loaded["conversations"]
+
+
+def test_history_to_langchain_skips_sched_cards_and_trims(tmp_path, monkeypatch):
+    from langchain_core.messages import HumanMessage
+
+    app_mod, _ = _stub_streamlit_and_load(tmp_path, monkeypatch)
+    history = [
+        {"role": "user", "content": "first question"},
+        {"role": "assistant", "content": "<div class=\"sched-card\">run card</div>", "kind": "scheduled_run"},
+        {"role": "user", "content": "second question"},
+        {"role": "assistant", "content": "second answer"},
+    ]
+    msgs = app_mod._history_to_langchain(history)
+    assert len(msgs) == 3  # the scheduled-run card is skipped
+    assert isinstance(msgs[0], HumanMessage) and msgs[0].content == "first question"
+    assert msgs[-1].content == "second answer"
+
+    # Budget trimming: an oversized earlier message is truncated to fit.
+    long_msg = {"role": "assistant", "content": "x" * 1000}
+    trimmed = app_mod._history_to_langchain([long_msg, {"role": "user", "content": "y"}])
+    assert len(trimmed) == 2
+    total = sum(len(str(m.content)) for m in trimmed)
+    assert total <= app_mod.HISTORY_MAX_CHARS
+
+
+def test_build_llm_messages_places_history_between_system_and_prompt(tmp_path, monkeypatch):
+    from langchain_core.messages import HumanMessage, SystemMessage
+    from planner import SearchPlan
+
+    app_mod, st = _stub_streamlit_and_load(tmp_path, monkeypatch)
+    st.session_state["rag_mode"] = True
+    app_mod.ragtool.active_source_label = lambda: "ACTIVE DOC LABEL"
+
+    plan = SearchPlan(search_query="python news", should_schedule=False, wait_minutes=0.0, run_count=1)
+    history = [{"role": "user", "content": "tell me about python"}, {"role": "assistant", "content": "python rocks"}]
+    msgs = app_mod._build_llm_messages("more details", plan, history)
+
+    system_count = sum(isinstance(m, SystemMessage) for m in msgs)
+    assert system_count == 2  # RAG label + search instruction
+    assert "ACTIVE DOC LABEL" in msgs[0].content
+    # History sits between system context and the live prompt.
+    assert msgs[system_count].content == "tell me about python"
+    assert msgs[-1].content == "more details"
+    assert isinstance(msgs[-1], HumanMessage)
+
+
+def test_stream_chatbot_yields_chunks_and_usage(tmp_path, monkeypatch):
+    from planner import SearchPlan
+
+    app_mod, st = _stub_streamlit_and_load(tmp_path, monkeypatch)
+    st.session_state["rag_mode"] = True
+    app_mod.ragtool.active_source_label = lambda: None
+
+    class FakeChunk:
+        def __init__(self, content="", usage=None):
+            self.content = content
+            self.usage_metadata = usage
+
+    class FakeBot:
+        def __init__(self, fail_stream=False):
+            self.fail_stream = fail_stream
+        def stream(self, inputs, stream_mode="messages"):
+            if self.fail_stream:
+                raise RuntimeError("stream broke")
+            yield FakeChunk("Hel"), {}
+            yield FakeChunk("lo", {"input_tokens": 3, "output_tokens": 2}), {}
+        def invoke(self, inputs):
+            return {"messages": [type("Msg", (), {"content": "fallback reply"})()]}
+
+    plan = SearchPlan(search_query="q", should_schedule=False, wait_minutes=0.0, run_count=1)
+
+    app_mod.chatbot = FakeBot()
+    out = list(app_mod._stream_chatbot("hi", plan, []))
+    assert out == [("Hel", None), ("lo", {"input_tokens": 3, "output_tokens": 2})]
+
+    # Streaming failure falls back to a single non-streamed reply.
+    app_mod.chatbot = FakeBot(fail_stream=True)
+    out = list(app_mod._stream_chatbot("hi", plan, []))
+    assert out == [("fallback reply", None)]
+
+
+def test_user_friendly_error_hides_internals(tmp_path, monkeypatch):
+    app_mod, _ = _stub_streamlit_and_load(tmp_path, monkeypatch)
+    msg = app_mod._user_friendly_error(RuntimeError("SECRET_KEY=abc123"))
+    assert "SECRET_KEY" not in msg
+    assert "RuntimeError" in msg
+
+
+def test_conversation_to_markdown_strips_card_html(tmp_path, monkeypatch):
+    app_mod, _ = _stub_streamlit_and_load(tmp_path, monkeypatch)
+    md = app_mod._conversation_to_markdown(
+        [
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": "plain answer"},
+            {"role": "assistant", "content": '<div class="sched-card">**bold run**</div>', "kind": "scheduled_run"},
+        ]
+    )
+    assert "plain answer" in md
+    assert '<div class="sched-card">' not in md
+    assert "bold run" in md
+
+
+def test_render_live_runs_in_appends_cards_to_container(tmp_path, monkeypatch):
+    app_mod, st = _stub_streamlit_and_load(tmp_path, monkeypatch)
+    st.session_state["conversations"] = {"c1": {"title": "t", "messages": []}}
+    st.session_state["active_conv"] = "c1"
+    st.session_state["job_conv"] = {}
+    st.session_state["seen_runs"] = set()
+
+    rendered = []
+    run = {
+        "job_id": "job-x",
+        "run_number": 1,
+        "completed_at": "2026-08-09T17:37:56.786280+00:00",
+        "content": "run produced this",
+    }
+    ok = app_mod._render_live_runs_in([run], lambda html, unsafe_allow_html: rendered.append(html))
+    assert ok is True
+    assert len(rendered) == 1 and "run produced this" in rendered[0]
+    stored = st.session_state["conversations"]["c1"]["messages"]
+    assert stored[-1]["kind"] == "scheduled_run"
+    # Runs routed to another chat render nothing for the active view.
+    st.session_state["conversations"]["other"] = {"title": "other chat", "messages": []}
+    st.session_state["job_conv"]["job-x"] = "other"
+    rendered.clear()
+    app_mod._render_live_runs_in([run], lambda html, unsafe_allow_html: rendered.append(html))
+    assert rendered == []
+    assert st.session_state["conversations"]["other"]["messages"][-1]["kind"] == "scheduled_run"

@@ -45,6 +45,10 @@ The scheduling engine was rewritten to fix the pain points of the original:
 - Multiple chats in the Streamlit UI — create, switch, and delete
   conversations from the sidebar; chats persist to `.hakathon/conversations.json`,
   and scheduled-run results appear in the chat that started them.
+- Multi-turn chat, streaming replies with per-message token counts, LLM chat
+  titles, and conversation export (`.md` / `.json`) in the UI.
+- Live run polling via a background `@st.fragment` in the UI — no full-page
+  auto-refresh needed (`streamlit-autorefresh` is now optional).
 
 ## Requirements
 
@@ -61,8 +65,9 @@ source .venv/bin/activate    # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
 ```
 
-The `requirements.txt` includes everything, including the new
-`streamlit-autorefresh` dependency the UI uses for background polling.
+The `requirements.txt` includes everything. `streamlit-autorefresh` is kept
+for backward compatibility but is no longer required — the UI polls with a
+`@st.fragment(run_every=...)` instead.
 
 If you'd rather install manually:
 
@@ -109,6 +114,24 @@ streamlit run streamlit_app.py
 Open the URL Streamlit prints (usually http://localhost:8501). The interface is
 intentionally minimal: one chat window. Scheduling still works — just describe
 it in natural language.
+
+UI niceties:
+
+- **Multi-turn memory** — prior turns are fed to the model (budget-trimmed to
+  the last ~20 messages / ~24k chars), so follow-ups like "and what about
+  TSLA?" actually work.
+- **Streaming replies** — tokens render as they arrive, with a subtle per-message
+  token counter under each answer.
+- **LLM chat titles** — a brand-new chat is renamed automatically after the
+  first exchange (fallback: the truncated first prompt).
+- **Export** — the sidebar can download the active conversation as `.md` or
+  `.json`.
+- **Live scheduled runs** — completed runs appear in the chat automatically; a
+  background `@st.fragment` poller (declared only while jobs are active) picks
+  them up every few seconds *without* redrawing the whole page.
+- **Safe persistence** — the conversation sidecar is written under an
+  in-process + POSIX advisory file lock, so multiple browser tabs or app
+  processes can't clobber each other's history.
 
 ### Example prompts
 
