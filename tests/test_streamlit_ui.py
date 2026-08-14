@@ -46,6 +46,17 @@ def _stub_streamlit_and_load(tmp_path, monkeypatch):
     st.spinner = lambda *a, **k: _NullContext()
     st.file_uploader = lambda *a, **k: None
     st.selectbox = lambda *a, **k: None
+
+    def _radio(*a, **k):
+        """Mimic Streamlit: a keyed radio returns its stored value, otherwise
+        the option at the requested index (so it never returns None)."""
+        key = k.get("key")
+        if key and key in st.session_state:
+            return st.session_state[key]
+        options = k.get("options") or [None]
+        return options[k.get("index", 0)]
+
+    st.radio = _radio
     st.toggle = lambda *a, **k: True
     st.progress = lambda *a, **k: _NullContext()
     st.status = lambda *a, **k: _NullContext()
@@ -212,3 +223,50 @@ def test_markdown_to_html_escapes_html_tags_from_llm_output(tmp_path, monkeypatc
     out = app_mod._markdown_to_html('<script>alert("xss")</script>')
     assert "<script>" not in out
     assert "&lt;script&gt;" in out
+
+
+def test_conversation_title_uses_first_user_message_and_truncates(tmp_path, monkeypatch):
+    app_mod, _ = _stub_streamlit_and_load(tmp_path, monkeypatch)
+    assert app_mod._conversation_title([]) == "new chat"
+    assert app_mod._conversation_title([{"role": "assistant", "content": "hi"}]) == "new chat"
+    assert app_mod._conversation_title([{"role": "user", "content": "  hello   world "}]) == "hello world"
+    long_prompt = "a very long question about the constitution " * 3
+    title = app_mod._conversation_title([{"role": "user", "content": long_prompt}])
+    assert title.endswith("…")
+    assert len(title) <= 31
+
+
+def test_route_scheduled_run_prefers_owner_chat_then_fallback(tmp_path, monkeypatch):
+    app_mod, _ = _stub_streamlit_and_load(tmp_path, monkeypatch)
+    conversations = {
+        "old": {"title": "old", "messages": []},
+        "newer": {"title": "newer", "messages": []},
+    }
+    # A job started in "newer" routes there even while another chat is older.
+    assert app_mod._route_scheduled_run("job-1", conversations, {"job-1": "newer"}) == "newer"
+    # Unknown job (e.g. resumed after restart) falls back to the oldest chat.
+    assert app_mod._route_scheduled_run("job-2", conversations, {}) == "old"
+    # Jobs routed to a deleted chat fall back too.
+    assert app_mod._route_scheduled_run("job-1", {"old": conversations["old"]}, {"job-1": "gone"}) == "old"
+    # No chats at all: nothing to route to.
+    assert app_mod._route_scheduled_run("job-2", {}, {}) is None
+
+
+def test_conversations_persist_roundtrip(tmp_path, monkeypatch):
+    app_mod, _ = _stub_streamlit_and_load(tmp_path, monkeypatch)
+    conversations = {
+        "c1": {"title": "t", "messages": [{"role": "user", "content": "question"}]},
+    }
+    conv_id = app_mod._create_conversation(conversations)
+    assert conv_id in conversations and conversations[conv_id]["messages"] == []
+    app_mod._persist_conversations(conversations, "c1", {"job-x": "c1"})
+
+    loaded = app_mod._load_conversations()
+    assert loaded["conversations"]["c1"]["messages"][0]["content"] == "question"
+    assert loaded["conversations"][conv_id]["title"] == "new chat"
+    assert loaded["active_conv"] == "c1"
+    assert loaded["job_conv"] == {"job-x": "c1"}
+
+    # A corrupt file must not crash loading — start fresh.
+    app_mod._conversations_path().write_text("{not json", encoding="utf-8")
+    assert app_mod._load_conversations()["conversations"] == {}

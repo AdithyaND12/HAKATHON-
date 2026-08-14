@@ -42,6 +42,9 @@ The scheduling engine was rewritten to fix the pain points of the original:
   *"search AI news at 3pm"*, *"monitor python news hourly"*.
 - Background scheduled jobs with cancellation, pause/resume, persistence, and
   no unnecessary wait after the final run.
+- Multiple chats in the Streamlit UI — create, switch, and delete
+  conversations from the sidebar; chats persist to `.hakathon/conversations.json`,
+  and scheduled-run results appear in the chat that started them.
 
 ## Requirements
 

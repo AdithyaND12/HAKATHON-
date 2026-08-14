@@ -1,7 +1,9 @@
 """Streamlit UI for the HAKATHON LangGraph chatbot.
 
-A single-page, chat-only interface. Replaces the CLI in `app.py` but reuses
-every module (config, planner, scheduler, tools, RAG, LangGraph wiring).
+A single-page, chat-only interface with multiple conversations (sidebar
+"chats" section), persisted to `.hakathon/conversations.json`. Replaces the
+CLI in `app.py` but reuses every module (config, planner, scheduler, tools,
+RAG, LangGraph wiring).
 
 Run with:
 
@@ -17,7 +19,9 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
+import uuid
 from datetime import datetime
 from pathlib import Path
 
@@ -339,10 +343,110 @@ html, body, [data-testid="stAppViewContainer"] {
 st.markdown(CUSTOM_CSS, unsafe_allow_html=True)
 
 
+# ---- Sessions (multiple chats) ------------------------------------------------
+# Each conversation keeps its own message history. Conversations, the active
+# selection, and the job->chat routing map are persisted to a JSON sidecar next
+# to the scheduler's registry so chats survive page refreshes. The RAG source,
+# model picker, and raw mode stay app-wide (shared by every chat).
+#
+#   conversations: {conv_id: {"title": str, "messages": [msg, ...]}}
+#   active_conv:   conv_id currently being viewed
+#   job_conv:      job_id -> conv_id that started the schedule (run cards route
+#                  back to the chat that created them)
+
+
+def _conversations_path() -> Path:
+    return config.DATA_DIR / "conversations.json"
+
+
+def _load_conversations() -> dict:
+    """Read persisted conversations (conversations + active id + job routing)."""
+    empty = {"conversations": {}, "active_conv": None, "job_conv": {}}
+    path = _conversations_path()
+    if not path.is_file():
+        return empty
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):  # noqa: S110 - corrupt sidecar, start fresh
+        return empty
+    if not isinstance(payload, dict):
+        return empty
+    conversations = payload.get("conversations") if isinstance(payload.get("conversations"), dict) else {}
+    job_conv = payload.get("job_conv") if isinstance(payload.get("job_conv"), dict) else {}
+    active_conv = payload.get("active_conv")
+    if active_conv not in conversations:
+        active_conv = None
+    return {"conversations": conversations, "active_conv": active_conv, "job_conv": job_conv}
+
+
+def _persist_conversations(conversations: dict, active_conv: "str | None", job_conv: dict) -> None:
+    """Atomically write the conversation store; never raises (best effort)."""
+    try:
+        config.DATA_DIR.mkdir(parents=True, exist_ok=True)
+        path = _conversations_path()
+        tmp = path.with_suffix(".json.tmp")
+        tmp.write_text(
+            json.dumps(
+                {
+                    "conversations": conversations,
+                    "active_conv": active_conv,
+                    "job_conv": job_conv,
+                },
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+        os.replace(tmp, path)
+    except OSError:  # noqa: S110 - persistence is best-effort
+        pass
+
+
+def _create_conversation(conversations: dict) -> str:
+    """Add a fresh empty conversation and return its id."""
+    conv_id = uuid.uuid4().hex[:12]
+    conversations[conv_id] = {"title": "new chat", "messages": []}
+    return conv_id
+
+
+def _conversation_title(messages: list[dict]) -> str:
+    """Name a chat after its first user message (truncated); fallback otherwise."""
+    for message in messages:
+        if message.get("role") == "user":
+            title = " ".join(str(message.get("content", "")).split())
+            return (title[:30] + "…") if len(title) > 30 else (title or "new chat")
+    return "new chat"
+
+
+def _route_scheduled_run(job_id: str, conversations: dict, job_conv: dict) -> "str | None":
+    """Which chat receives a completed run: the chat that started the job, else
+    the oldest surviving chat (covers jobs resumed after a restart)."""
+    target = job_conv.get(job_id)
+    if target in conversations:
+        return target
+    if conversations:
+        return next(iter(conversations))
+    return None
+
+
 # ---- Session state -----------------------------------------------------------
 
-if "messages" not in st.session_state:
-    st.session_state.messages = []  # list of {"role": "user"|"assistant", "content": str}
+if "conversations" not in st.session_state:
+    _loaded = _load_conversations()
+    conversations = _loaded["conversations"]
+    if not conversations:
+        # Migrate the pre-multi-chat single history into a default conversation.
+        legacy = st.session_state.get("messages")
+        if legacy:
+            conversations["default"] = {
+                "title": _conversation_title(legacy),
+                "messages": list(legacy),
+            }
+            st.session_state.pop("messages", None)
+        else:
+            _create_conversation(conversations)
+    st.session_state.conversations = conversations
+    st.session_state.job_conv = _loaded["job_conv"]
+    st.session_state.active_conv = _loaded["active_conv"] or next(iter(conversations))
 
 if "seen_runs" not in st.session_state:
     # Track scheduled-run history files we have already surfaced in this session.
@@ -531,6 +635,59 @@ st.markdown(
 # ---- Sidebar (health, RAG documents, reset) ---------------------------------
 
 with st.sidebar:
+    st.markdown("### chats")
+
+    if st.button("＋ new chat", use_container_width=True):
+        conv_id = _create_conversation(st.session_state.conversations)
+        st.session_state.active_conv = conv_id
+        st.session_state.pop("conv_picker", None)
+        _persist_conversations(
+            st.session_state.conversations,
+            st.session_state.active_conv,
+            st.session_state.job_conv,
+        )
+        st.rerun()
+
+    chat_id_order = list(st.session_state.conversations)
+    chat_labels = {
+        cid: conv.get("title") or "new chat"
+        for cid, conv in st.session_state.conversations.items()
+    }
+    try:
+        picker_index = chat_id_order.index(st.session_state.active_conv)
+    except ValueError:
+        picker_index = 0
+    picked_chat = st.radio(
+        "chat",
+        options=chat_id_order,
+        index=picker_index,
+        format_func=lambda cid: chat_labels.get(cid, cid),
+        key="conv_picker",
+        label_visibility="collapsed",
+    )
+    if picked_chat != st.session_state.active_conv:
+        st.session_state.active_conv = picked_chat
+        _persist_conversations(
+            st.session_state.conversations,
+            st.session_state.active_conv,
+            st.session_state.job_conv,
+        )
+        st.rerun()
+
+    if st.button("delete chat", use_container_width=True, disabled=len(chat_id_order) <= 1):
+        st.session_state.conversations.pop(st.session_state.active_conv, None)
+        if not st.session_state.conversations:
+            _create_conversation(st.session_state.conversations)
+        st.session_state.active_conv = next(iter(st.session_state.conversations))
+        st.session_state.pop("conv_picker", None)
+        _persist_conversations(
+            st.session_state.conversations,
+            st.session_state.active_conv,
+            st.session_state.job_conv,
+        )
+        st.rerun()
+
+    st.divider()
     st.markdown("### session")
 
     model_labels = list(config.GEMINI_MODEL_OPTIONS)
@@ -646,7 +803,14 @@ with st.sidebar:
 
     st.divider()
     if st.button("clear chat", use_container_width=True):
-        st.session_state.messages = []
+        chat = st.session_state.conversations[st.session_state.active_conv]
+        chat["messages"] = []
+        chat["title"] = "new chat"
+        _persist_conversations(
+            st.session_state.conversations,
+            st.session_state.active_conv,
+            st.session_state.job_conv,
+        )
         st.rerun()
     if st.button("cancel all schedules", use_container_width=True):
         for job in _registry.active():
@@ -656,7 +820,8 @@ with st.sidebar:
 
 # ---- Render chat history -----------------------------------------------------
 
-for message in st.session_state.messages:
+active_chat = st.session_state.conversations[st.session_state.active_conv]
+for message in active_chat["messages"]:
     role = message["role"]
     # Render pre-formatted scheduled-run cards as raw HTML+markdown; keep
     # regular chat bubbles as plain st.markdown so they get the bubble style.
@@ -748,13 +913,25 @@ def _markdown_to_html(text: str) -> str:
 new_runs = _fetch_new_scheduled_runs()
 for run in new_runs:
     card_html = _render_scheduled_run_card(run)
-    st.markdown(card_html, unsafe_allow_html=True)
-    st.session_state.messages.append(
+    target = _route_scheduled_run(
+        run["job_id"], st.session_state.conversations, st.session_state.job_conv
+    )
+    if target is None:
+        continue
+    st.session_state.conversations[target]["messages"].append(
         {
             "role": "assistant",
             "kind": "scheduled_run",
             "content": card_html,
         }
+    )
+    if target == st.session_state.active_conv:
+        st.markdown(card_html, unsafe_allow_html=True)
+if new_runs:
+    _persist_conversations(
+        st.session_state.conversations,
+        st.session_state.active_conv,
+        st.session_state.job_conv,
     )
 
 
@@ -763,8 +940,11 @@ for run in new_runs:
 prompt = st.chat_input("ask anything · try 'search AI news every 5 min for 3 times'")
 
 if prompt:
-    # Show the user's message immediately.
-    st.session_state.messages.append({"role": "user", "content": prompt})
+    # Show the user's message immediately in the active conversation.
+    active_chat = st.session_state.conversations[st.session_state.active_conv]
+    active_chat["messages"].append({"role": "user", "content": prompt})
+    if active_chat["title"] == "new chat":
+        active_chat["title"] = _conversation_title(active_chat["messages"])
     with st.chat_message("user"):
         st.markdown(prompt)
 
@@ -809,8 +989,16 @@ if prompt:
                     "Use the sidebar to cancel."
                 )
                 st.markdown(start_text)
-                st.session_state.messages.append(
+                active_chat["messages"].append(
                     {"role": "assistant", "content": start_text}
+                )
+                # Route completed runs of this job back to this chat, even if
+                # the user switches conversations before the job finishes.
+                st.session_state.job_conv[job.id] = st.session_state.active_conv
+                _persist_conversations(
+                    st.session_state.conversations,
+                    st.session_state.active_conv,
+                    st.session_state.job_conv,
                 )
                 # Force a rerun so the auto-refresh block at the top of the
                 # script picks up the new active schedule and starts polling.
@@ -818,7 +1006,12 @@ if prompt:
             except ScheduleValidationError as exc:
                 err = f"Invalid schedule: {exc}"
                 st.error(err)
-                st.session_state.messages.append({"role": "assistant", "content": err})
+                active_chat["messages"].append({"role": "assistant", "content": err})
+                _persist_conversations(
+                    st.session_state.conversations,
+                    st.session_state.active_conv,
+                    st.session_state.job_conv,
+                )
         else:
             with st.spinner("thinking..."):
                 try:
@@ -826,4 +1019,9 @@ if prompt:
                 except Exception as exc:  # noqa: BLE001
                     reply = f"⚠️ Error talking to Gemini: `{exc}`"
             st.markdown(reply)
-            st.session_state.messages.append({"role": "assistant", "content": reply})
+            active_chat["messages"].append({"role": "assistant", "content": reply})
+            _persist_conversations(
+                st.session_state.conversations,
+                st.session_state.active_conv,
+                st.session_state.job_conv,
+            )
