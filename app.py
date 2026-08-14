@@ -201,6 +201,22 @@ llm_with_tools = llm.bind_tools(tools)
 scheduled_llm_with_tools = llm.bind_tools(agent_tools)
 
 
+def set_chatbot_model(model: str) -> None:
+    """Switch the active chat model at runtime.
+
+    Rebuilds the tool-bound LLM and reassigns the module globals. The compiled
+    graph reads these globals on every invocation, so both interactive chat
+    and scheduled runs pick up the new model immediately.
+    """
+    global llm, llm_with_tools, scheduled_llm_with_tools
+    llm = ChatGoogleGenerativeAI(
+        model=model,
+        google_api_key=config.GEMINI_API_KEY,
+    )
+    llm_with_tools = llm.bind_tools(tools)
+    scheduled_llm_with_tools = llm.bind_tools(agent_tools)
+
+
 class ChatState(TypedDict):
     messages: Annotated[list[BaseMessage], add_messages]
 

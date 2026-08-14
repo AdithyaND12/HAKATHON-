@@ -46,6 +46,7 @@ def _stub_streamlit_and_load(tmp_path, monkeypatch):
     st.spinner = lambda *a, **k: _NullContext()
     st.file_uploader = lambda *a, **k: None
     st.selectbox = lambda *a, **k: None
+    st.toggle = lambda *a, **k: True
     st.progress = lambda *a, **k: _NullContext()
     st.status = lambda *a, **k: _NullContext()
     st.success = lambda *a, **k: None

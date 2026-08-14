@@ -22,6 +22,12 @@ _RETIRED_GEMINI_MODELS = {
     "gemini-2.5-flash": "gemini-3.5-flash-lite",
     "models/gemini-2.5-flash": "gemini-3.5-flash-lite",
 }
+# User-selectable chat models (label -> model id), in display order.
+GEMINI_MODEL_OPTIONS = {
+    "Gemini 3.5 Flash-Lite": "gemini-3.5-flash-lite",
+    "Gemini 3.1 Flash-Lite": "gemini-3.1-flash-lite",
+    "Gemini 3.5 Flash": "gemini-3.5-flash",
+}
 DEFAULT_HTTP_TIMEOUT_SECONDS = 10.0
 DEFAULT_WAIT_MAX_SECONDS = 3600.0
 DEFAULT_MAX_AUTO_RUNS = 20

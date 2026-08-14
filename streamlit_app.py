@@ -47,7 +47,7 @@ except ImportError:  # pragma: no cover - only hit when the optional dep is miss
 # Reuse everything the CLI used.
 import config
 import ragtool
-from app import _build_messages, _registry, chatbot, scheduler
+from app import _build_messages, _registry, chatbot, scheduler, set_chatbot_model
 from planner import SearchExecutionInstruction, SearchPlan, create_search_plan
 from scheduler import ScheduleValidationError, _extract_content
 
@@ -397,11 +397,26 @@ if _active_now or _grace_active:
 def _run_chatbot(prompt: str, plan: SearchPlan) -> str:
     """One-off invocation of the LangGraph chatbot (non-scheduled path)."""
     system_messages: list[SystemMessage] = []
-    source_label = ragtool.active_source_label()
-    if source_label:
-        # Tell the LLM which uploaded document the RAG tool can see so it
-        # reaches for get_rag_chunks when the question targets that PDF.
-        system_messages.append(SystemMessage(content=source_label))
+    if st.session_state.get("rag_mode", True):
+        # RAG on: tell the LLM which uploaded document the RAG tool can see so
+        # it reaches for get_rag_chunks when the question targets that PDF.
+        source_label = ragtool.active_source_label()
+        if source_label:
+            system_messages.append(SystemMessage(content=source_label))
+    else:
+        # RAG off: hand the WHOLE PDF to the model — no chunking, no embedding.
+        full_text = ragtool.retrieve_full_text()
+        if full_text:
+            system_messages.append(
+                SystemMessage(
+                    content=(
+                        "The user's active document is provided below IN FULL "
+                        "(RAG is disabled — nothing was chunked or embedded). "
+                        "Answer questions about it strictly from this text and "
+                        "do not call any retrieval tools.\n\n" + full_text
+                    )
+                )
+            )
     system_messages.append(
         SystemMessage(content=SearchExecutionInstruction(plan.search_query).render())
     )
@@ -452,8 +467,8 @@ def _plan_summary_html(plan: SearchPlan) -> str:
     return " · ".join(parts)
 
 
-def _handle_pdf_upload(uploaded) -> None:
-    """Save an uploaded PDF to disk, index it, and make it the active RAG doc."""
+def _handle_pdf_upload(uploaded, *, index: bool) -> None:
+    """Save an uploaded PDF; index it for RAG or store it raw (no embeddings)."""
     data = uploaded.getvalue()
     sha = hashlib.sha256(data).hexdigest()
     if st.session_state.get("_pdf_upload_sha") == sha:
@@ -470,20 +485,33 @@ def _handle_pdf_upload(uploaded) -> None:
         st.error(f"Could not save upload: {exc}")
         return
 
-    with st.status(f"indexing `{uploaded.name}`…", expanded=True) as status:
-        bar = st.progress(0.0, text="embedding chunks…")
+    if index:
+        with st.status(f"indexing `{uploaded.name}`…", expanded=True) as status:
+            bar = st.progress(0.0, text="embedding chunks…")
 
-        def _report(done: int, total: int) -> None:
-            bar.progress(min(done / max(total, 1), 1.0))
+            def _report(done: int, total: int) -> None:
+                bar.progress(min(done / max(total, 1), 1.0))
 
-        try:
-            count = ragtool.index_pdf(target, progress=_report, name=uploaded.name)
-        except Exception as exc:  # noqa: BLE001
-            status.update(label="indexing failed", state="error")
-            st.error(f"Indexing failed: `{exc}`")
-            return
-        ragtool.set_active_collection(ragtool.collection_name_for_sha(sha))
-        status.update(label=f"indexed {count} chunks", state="complete")
+            try:
+                count = ragtool.index_pdf(target, progress=_report, name=uploaded.name)
+            except Exception as exc:  # noqa: BLE001
+                status.update(label="indexing failed", state="error")
+                st.error(f"Indexing failed: `{exc}`")
+                return
+            ragtool.set_active_collection(ragtool.collection_name_for_sha(sha))
+            status.update(label=f"indexed {count} chunks", state="complete")
+    else:
+        with st.status(f"reading `{uploaded.name}`…", expanded=True) as status:
+            try:
+                meta = ragtool.store_raw_pdf(target, name=uploaded.name)
+            except Exception as exc:  # noqa: BLE001
+                status.update(label="reading failed", state="error")
+                st.error(f"Could not read PDF: `{exc}`")
+                return
+            status.update(
+                label=f"stored {meta['pages']} pages · no chunking, no embeddings",
+                state="complete",
+            )
     st.rerun()
 
 
@@ -504,8 +532,32 @@ st.markdown(
 
 with st.sidebar:
     st.markdown("### session")
-    st.caption(f"model: `{config.GEMINI_MODEL}`")
-    st.caption(f"embedding: `{config.JINA_EMBEDDING_MODEL}`")
+
+    model_labels = list(config.GEMINI_MODEL_OPTIONS)
+    default_label = next(
+        (
+            label
+            for label, model_id in config.GEMINI_MODEL_OPTIONS.items()
+            if model_id == config.GEMINI_MODEL
+        ),
+        model_labels[0],
+    )
+    picked_model = st.selectbox(
+        "model",
+        options=model_labels,
+        index=model_labels.index(default_label),
+        key="model_picker",
+    )
+    if picked_model and picked_model != st.session_state.get("_active_model_label"):
+        set_chatbot_model(config.GEMINI_MODEL_OPTIONS[picked_model])
+        st.session_state["_active_model_label"] = picked_model
+    else:
+        st.session_state.setdefault("_active_model_label", default_label)
+    st.caption(f"active: **{st.session_state['_active_model_label']}**")
+    if st.session_state.get("rag_mode", True):
+        st.caption(f"embedding: `{config.JINA_EMBEDDING_MODEL}`")
+    else:
+        st.caption("embedding: off (raw mode)")
     active = _registry.active()
     st.caption(f"active schedules: **{len(active)}**")
     if active:
@@ -515,46 +567,82 @@ with st.sidebar:
             )
     st.divider()
 
-    # ---- RAG documents: pick the active one, upload new PDFs ----------------
+    # ---- Documents: RAG (chunk+embed) or raw (whole PDF to the model) ------
     st.markdown("### documents")
-    docs = ragtool.list_indexed_documents()
-    doc_options = [None] + [d["collection"] for d in docs]
-    doc_labels = {None: "no document"}
-    for doc in docs:
-        doc_labels[doc["collection"]] = f'{doc["name"]} · {doc["chunks"]} chunks'
-    current = ragtool.active_collection()
-    if current is None and docs:
-        # Nothing selected (e.g. fresh process after a restart): fall back to
-        # the most recently indexed document so RAG works immediately.
-        current = docs[0]["collection"]
-        ragtool.set_active_collection(current)
-    try:
-        picker_index = doc_options.index(current)
-    except ValueError:
-        picker_index = 0
-    picked = st.selectbox(
-        "RAG source",
-        options=doc_options,
-        index=picker_index,
-        format_func=lambda c: doc_labels.get(c, str(c)),
-        key="rag_source_picker",
-        help="The document the LLM's get_rag_chunks tool queries.",
+    rag_mode = st.toggle(
+        "RAG mode",
+        value=st.session_state.get("rag_mode", True),
+        key="rag_mode",
+        help=(
+            "On: PDFs are chunked, embedded, and searched via get_rag_chunks. "
+            "Off: no chunking or embedding — the whole PDF goes to the model."
+        ),
     )
-    if picked != current:
-        ragtool.set_active_collection(picked)
-        st.rerun()
 
-    uploaded = st.file_uploader("Upload a PDF to index", type=["pdf"], key="pdf_uploader")
-    if uploaded is not None:
-        _handle_pdf_upload(uploaded)
+    if rag_mode:
+        docs = ragtool.list_indexed_documents()
+        doc_options = [None] + [d["collection"] for d in docs]
+        doc_labels = {None: "no document"}
+        for doc in docs:
+            doc_labels[doc["collection"]] = f'{doc["name"]} · {doc["chunks"]} chunks'
+        current = ragtool.active_collection()
+        if current is None and docs:
+            # Nothing selected (e.g. fresh process after a restart): fall back to
+            # the most recently indexed document so RAG works immediately.
+            current = docs[0]["collection"]
+            ragtool.set_active_collection(current)
+        try:
+            picker_index = doc_options.index(current)
+        except ValueError:
+            picker_index = 0
+        picked = st.selectbox(
+            "RAG source",
+            options=doc_options,
+            index=picker_index,
+            format_func=lambda c: doc_labels.get(c, str(c)),
+            key="rag_source_picker",
+            help="The document the LLM's get_rag_chunks tool queries.",
+        )
+        if picked != current:
+            ragtool.set_active_collection(picked)
+            st.rerun()
 
-    if st.button(
-        "remove active document",
-        use_container_width=True,
-        disabled=picked is None,
-    ):
-        ragtool.remove_indexed_document(picked)
-        st.rerun()
+        uploaded = st.file_uploader("Upload a PDF to index", type=["pdf"], key="pdf_uploader")
+        if uploaded is not None:
+            _handle_pdf_upload(uploaded, index=True)
+
+        if st.button(
+            "remove active document",
+            use_container_width=True,
+            disabled=picked is None,
+        ):
+            ragtool.remove_indexed_document(picked)
+            st.rerun()
+    else:
+        raw_id = ragtool.active_raw()
+        if raw_id:
+            meta = ragtool.raw_meta(raw_id)
+            label = f'{meta["name"]} · {meta["pages"]} pages' if meta else raw_id
+            st.caption(f"active: **{label}**")
+            st.caption("passed to the model in full · no chunking, no embeddings")
+        else:
+            st.caption("no document — upload one below")
+
+        uploaded = st.file_uploader(
+            "Upload a PDF (raw — no chunking/embedding)",
+            type=["pdf"],
+            key="raw_pdf_uploader",
+        )
+        if uploaded is not None:
+            _handle_pdf_upload(uploaded, index=False)
+
+        if st.button(
+            "remove active document",
+            use_container_width=True,
+            disabled=raw_id is None,
+        ):
+            ragtool.remove_raw_document(raw_id)
+            st.rerun()
 
     st.divider()
     if st.button("clear chat", use_container_width=True):

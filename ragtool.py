@@ -529,8 +529,16 @@ def retrieve_active_chunks(query: str = DEFAULT_QUERY, k: int = DEFAULT_TOP_K) -
     """Retrieve chunks from the active user-uploaded document.
 
     Returns a prompt for the LLM when no document has been uploaded yet,
-    rather than querying an empty store.
+    rather than querying an empty store. When a raw (un-embedded) document is
+    active, returns its full text instead of searching.
     """
+    if active_raw():
+        full_text = retrieve_full_text()
+        if full_text:
+            return (
+                "The active document is in raw mode (RAG disabled) — here is "
+                "its full text; answer strictly from it.\n\n" + full_text
+            )
     collection_name = _ACTIVE_COLLECTION
     if not collection_name:
         return (
@@ -545,3 +553,163 @@ def retrieve_active_chunks(query: str = DEFAULT_QUERY, k: int = DEFAULT_TOP_K) -
             "RAG retrieval is temporarily unavailable "
             f"(external API error: {exc})."
         )
+
+
+# ---- Raw (no-embedding) PDF support ------------------------------------------
+# When RAG is switched off the app never chunks or embeds anything: the
+# uploaded PDF is kept as-is and its FULL text is handed to the model as
+# context. A raw document is tracked by its own sidecar files and never
+# touches Chroma or the embedding API.
+
+RAW_PREFIX = "raw_"
+_ACTIVE_RAW: Optional[str] = None
+
+
+def raw_id_for_sha(pdf_sha256: str) -> str:
+    """Stable raw-document id derived from a PDF's content hash."""
+    return f"{RAW_PREFIX}{pdf_sha256[:16]}"
+
+
+def _raw_meta_path(raw_id: str) -> Path:
+    return PERSIST_DIRECTORY / f".meta_{raw_id}.json"
+
+
+def _raw_active_path() -> Path:
+    return PERSIST_DIRECTORY / ".active_raw_document"
+
+
+def set_active_raw(raw_id: Optional[str]) -> None:
+    """Choose which stored PDF is the raw (un-embedded) active document.
+
+    The selection is persisted next to the vector store so it survives app
+    restarts (the in-memory value alone resets on every new process).
+    """
+    global _ACTIVE_RAW
+    _ACTIVE_RAW = raw_id or None
+    try:
+        PERSIST_DIRECTORY.mkdir(parents=True, exist_ok=True)
+        path = _raw_active_path()
+        if _ACTIVE_RAW:
+            path.write_text(_ACTIVE_RAW, encoding="utf-8")
+        else:
+            path.unlink(missing_ok=True)
+    except OSError:  # noqa: S110 - persistence is best-effort
+        pass
+
+
+def active_raw() -> Optional[str]:
+    """Return the currently selected raw document id, or None when unset."""
+    global _ACTIVE_RAW
+    if _ACTIVE_RAW is None:
+        path = _raw_active_path()
+        if path.is_file():
+            try:
+                name = path.read_text(encoding="utf-8").strip()
+                if name and _raw_meta_path(name).is_file():
+                    _ACTIVE_RAW = name
+            except OSError:  # noqa: S110 - corrupt sidecar, treat as unset
+                pass
+    return _ACTIVE_RAW
+
+
+def raw_meta(raw_id: str) -> Optional[dict]:
+    """Metadata for a raw document, or None when the sidecar is missing."""
+    meta_path = _raw_meta_path(raw_id)
+    if not meta_path.is_file():
+        return None
+    try:
+        return json.loads(meta_path.read_text(encoding="utf-8"))
+    except ValueError:  # noqa: S110 - corrupt sidecar
+        return None
+
+
+def store_raw_pdf(
+    pdf_path: Path | str,
+    *,
+    name: Optional[str] = None,
+) -> dict:
+    """Save a PDF as the active raw document WITHOUT chunking or embedding.
+
+    Only the file on disk and a small sidecar are recorded — no Chroma
+    collection is touched, so no embedding API calls are made. Returns the
+    metadata record.
+    """
+    path = Path(pdf_path)
+    if not path.is_file():
+        raise FileNotFoundError(f"PDF not found at {path}.")
+    pages = _load_pdf_pages_from(path)
+    if not pages:
+        raise ValueError(
+            f"PDF at {path} contains no extractable text. "
+            "It may be a scanned/image-only PDF with no text layer."
+        )
+    sha = _pdf_hash(path)
+    raw_id = raw_id_for_sha(sha)
+    meta = {
+        "collection": raw_id,
+        "name": name or path.name,
+        "source": str(path),
+        "sha256": sha,
+        "embedding_model": None,
+        "pages": len(pages),
+        "chunks": 0,
+        "raw": True,
+        "indexed_at": datetime.now(timezone.utc).isoformat(),
+    }
+    PERSIST_DIRECTORY.mkdir(parents=True, exist_ok=True)
+    _raw_meta_path(raw_id).write_text(json.dumps(meta, indent=2), encoding="utf-8")
+    set_active_raw(raw_id)
+    return meta
+
+
+def remove_raw_document(raw_id: Optional[str]) -> None:
+    """Delete a raw document's sidecar and clear it when it is active."""
+    if not raw_id:
+        return
+    try:
+        _raw_meta_path(raw_id).unlink(missing_ok=True)
+    except OSError:
+        pass
+    if active_raw() == raw_id:
+        set_active_raw(None)
+
+
+def retrieve_full_text() -> Optional[str]:
+    """The COMPLETE text of the active document, page by page.
+
+    Used when RAG is switched off: nothing is chunked, embedded, or retrieved
+    — the model simply receives the whole document as context. Falls back to
+    the currently selected indexed document's source PDF when no raw document
+    has been stored, so toggling RAG off mid-session still has full text.
+    """
+    source: Optional[Path] = None
+    raw_id = active_raw()
+    if raw_id:
+        meta = raw_meta(raw_id)
+        if meta:
+            source = Path(meta.get("source", ""))
+    if source is None or not source.is_file():
+        collection_name = active_collection()
+        if collection_name:
+            meta_path = _collection_meta_path(collection_name)
+            if meta_path.is_file():
+                try:
+                    source = Path(
+                        json.loads(meta_path.read_text(encoding="utf-8")).get(
+                            "source", ""
+                        )
+                    )
+                except ValueError:  # noqa: S110 - corrupt sidecar
+                    source = None
+    if source is None or not source.is_file():
+        return None
+    pages = _load_pdf_pages_from(source)
+    if not pages:
+        return None
+    parts: list[str] = []
+    for document in pages:
+        page_num = document.metadata.get("page", "?")
+        if isinstance(page_num, int):
+            page_num = page_num + 1
+        parts.append(f"--- Page {page_num} ---\n{document.page_content.strip()}")
+    return "\n\n".join(parts)

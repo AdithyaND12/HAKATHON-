@@ -123,6 +123,40 @@ Started a schedule? Each completed run appears back in the chat automatically
 as an amber-highlighted message. Use the collapsed sidebar (top-left `»`) to
 view active schedules, clear the chat, or cancel every running job.
 
+## Scheduling function
+
+Schedules are created programmatically through `Scheduler.start()` (or the
+backward-compatible `app.run_scheduled_search()` helper) — identified by
+`SearchPlan` from the planner:
+
+```python
+from app import run_scheduled_search
+
+job = run_scheduled_search(
+    prompt="check python news every 10 minutes for 5 times",
+    interval_minutes=10.0,     # Optional[float] — gap between runs (None = no repeat)
+    run_count=5,               # Optional[int] — how many runs total (None = unlimited)
+    search_query="python news",  # Optional[str] — fallback query for the search tool
+    absolute_start_iso="2026-08-14T09:00:00",  # Optional[str] — first run at a fixed time
+    task_type="search",        # "search" | "rag" | "reminder" | "calculation" | "chat"
+    reminder_text=None,        # required when task_type="reminder"
+)
+print(job.id)  # stable job id for /jobs, /cancel, /pause, /resume
+```
+
+The equivalent `Scheduler.start(**kwargs)` (scheduler.py) accepts the same
+arguments plus an optional `job_id`. Examples of what the planner accepts as
+natural language:
+
+- `"check tesla news every 10 minutes for 5 times"` → interval 10m, 5 runs
+- `"search AI news at 3pm"` → a single run at 15:00 local time
+- `"monitor python news hourly"` → interval 60m, run forever (no run_count)
+- `"remind me to drink water in 5 minutes"` → one reminder in 5 minutes
+
+Every job runs in its own background worker thread, persists to
+`.hakathon/jobs.json`, and can be controlled from the CLI with `/jobs`,
+`/cancel <id>`, `/pause <id>`, `/resume <id>`, and `/logs <id>`.
+
 ### Legacy CLI (optional)
 
 If you prefer the terminal, the old CLI still works:
