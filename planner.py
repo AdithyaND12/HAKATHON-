@@ -270,6 +270,47 @@ def _parse_absolute_start(prompt: str) -> Optional[datetime]:
     return None
 
 
+# Removes "every N minutes", "for N times", "hourly", "at 3pm", "tomorrow",
+# "in 5 minutes", and other scheduling verbs from a prompt. Shared between the
+# planner and app.py's scheduled-run sanitizer so the two never drift apart.
+_SCHEDULING_WORDS = (
+    r"hourly|daily|weekly|monthly|repeatedly|periodically|recurring|"
+    r"repeat|monitor|refresh|schedule"
+)
+
+
+def strip_schedule_phrases(prompt: str) -> str:
+    """Return `prompt` with scheduling directive phrases removed.
+
+    Keeps the task words ("search bike info") and drops everything that looks
+    like a schedule ("every 1 minute for 3 times", "tomorrow at 9am").
+    """
+    text = re.sub(
+        rf"\b(?:for\s+)?(?:every|each)\s+{_NUMBER_TOKEN}\s*"
+        r"(?:seconds?|secs?|minutes?|mins?|hours?|hrs?|days?)\b",
+        " ", prompt, flags=re.IGNORECASE,
+    )
+    text = re.sub(
+        r"\b(?:every|each)\s+(?:\S+\s+)?(?:hour|day|week|month)\b",
+        " ", text, flags=re.IGNORECASE,
+    )
+    text = re.sub(
+        rf"\b(?:for\s+)?{_NUMBER_TOKEN}\s*(?:times?|runs?|checks?|iterations?)\b",
+        " ", text, flags=re.IGNORECASE,
+    )
+    text = re.sub(rf"\b(?:{_SCHEDULING_WORDS})\b", " ", text, flags=re.IGNORECASE)
+    text = re.sub(
+        r"\b(?:in|after)\s+\d+(?:\.\d+)?\s*(?:minutes?|mins?|hours?|hrs?)\b",
+        " ", text, flags=re.IGNORECASE,
+    )
+    text = re.sub(
+        r"\bat\s+\d{1,2}(?::\d{2})?\s*(?:am|pm)?\b",
+        " ", text, flags=re.IGNORECASE,
+    )
+    text = re.sub(r"\b(?:tomorrow|tonight)\b", " ", text, flags=re.IGNORECASE)
+    return re.sub(r"\s+", " ", text).strip(" ,.!?")
+
+
 def _fallback_search_plan(prompt: str) -> SearchPlan:
     """Recover common phrasings when the local model rejects JSON mode."""
     duration_match = _DURATION_RE.search(prompt)
@@ -308,23 +349,7 @@ def _fallback_search_plan(prompt: str) -> SearchPlan:
         wait_minutes = 0.0
 
     # Clean the schedule/count phrases out of the query.
-    query = prompt
-    query = re.sub(
-        rf"\b(?:for\s+)?(?:every|each)\s+{_NUMBER_TOKEN}\s*"
-        r"(?:seconds?|secs?|minutes?|mins?|hours?|hrs?|days?)\b",
-        " ", query, flags=re.IGNORECASE,
-    )
-    query = re.sub(
-        rf"\b(?:for\s+)?{_NUMBER_TOKEN}\s*(?:times?|runs?|checks?|iterations?)\b",
-        " ", query, flags=re.IGNORECASE,
-    )
-    query = _HOURLY_RE.sub(" ", query)
-    query = _DAILY_RE.sub(" ", query)
-    query = _IN_MINUTES_RE.sub(" ", query)
-    query = re.sub(r"\bat\s+\d{1,2}(?::\d{2})?\s*(?:am|pm)?\b", " ", query, flags=re.IGNORECASE)
-    query = _TOMORROW_RE.sub(" ", query)
-    query = _TONIGHT_RE.sub(" ", query)
-    query = re.sub(r"\s+", " ", query).strip(" ,.!?") or prompt.strip()
+    query = strip_schedule_phrases(prompt) or prompt.strip()
 
     # ---- Task-type detection --------------------------------------------------
     task_type, reminder_text = _detect_task_type(prompt, query)
@@ -395,14 +420,32 @@ def _detect_task_type(prompt: str, cleaned_query: str) -> tuple[TaskType, Option
 # ---- LLM planner --------------------------------------------------------------
 
 
-def _build_llm() -> ChatGoogleGenerativeAI:
+def build_chat_llm(model: Optional[str] = None) -> ChatGoogleGenerativeAI:
+    """Build a chat LLM client with the configured API key and request timeout.
+
+    This is the single construction point for the chat model so every caller
+    (chat + planner) shares the same settings.
+    """
     return ChatGoogleGenerativeAI(
-        model=config.GEMINI_MODEL,
+        model=model or config.GEMINI_MODEL,
         google_api_key=config.GEMINI_API_KEY,
+        request_timeout=config.HTTP_TIMEOUT_SECONDS,
     )
 
 
-_llm = _build_llm()
+_llm = build_chat_llm()
+
+
+def set_planner_model(model: str) -> None:
+    """Rebuild the planner LLM for a new model.
+
+    Resets the structured-output planner and its fallback-method index so the
+    planner and the chat model always agree on which model is active.
+    """
+    global _llm, search_planner, _current_planner_method_index
+    _llm = build_chat_llm(model)
+    search_planner = _build_search_planner(_PLANNER_METHODS[0])
+    _current_planner_method_index = 0
 
 
 def _build_search_planner(method: str):
@@ -525,6 +568,15 @@ def _clamp_plan(plan: SearchPlan) -> SearchPlan:
         run_count=run_count,
         absolute_start_iso=plan.absolute_start_iso,
     )
+
+
+def fallback_search_plan(prompt: str) -> SearchPlan:
+    """Public regex-only planning path with bounds applied, no LLM call.
+
+    Used by the CLI when the LLM planner fails so scheduling intent in the
+    prompt is still honored.
+    """
+    return _clamp_plan(_fallback_search_plan(prompt))
 
 
 def create_search_plan(prompt: str) -> SearchPlan:

@@ -1,6 +1,6 @@
 """Interactive CLI entrypoint for the HAKATHON LangGraph chatbot.
 
-This file is intentionally thin. All heavy logic lives in dedicated modules:
+Dedicated logic lives in modules:
 
     config.py         — env parsing
     planner.py        — search + schedule planner (LLM + regex fallback)
@@ -8,22 +8,27 @@ This file is intentionally thin. All heavy logic lives in dedicated modules:
     tools_search.py   — DuckDuckGo tool wrapped with retry/backoff
     ragtool.py        — user-uploaded PDF RAG
 
+This module owns the LangGraph agent (tools + graph), the scheduler wiring,
+and the interactive CLI (including scheduled-run message preparation).
+
 Public names (`get_stock_price`, `run_scheduled_search`, `chatbot`,
-`ALPHAVANTAGE_API_KEY`, `HTTP_TIMEOUT_SECONDS`, `requests`) are re-exported here
-so the existing `tests/test_app.py` continues to work unchanged.
+`ALPHAVANTAGE_API_KEY`, `HTTP_TIMEOUT_SECONDS`, `requests`, `llm`, `_registry`,
+`scheduler`, `set_chatbot_model`) are re-exported here so the existing tests
+and `streamlit_app.py` continue to work unchanged.
 """
 
 from __future__ import annotations
 
 import logging
+import time
+from datetime import datetime
 from typing import Optional
 
-import arrow  # kept for backward compatibility with the original tests
 import requests
 from dotenv import load_dotenv
-from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage
+from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage, trim_messages
 from langchain_core.tools import tool
-from langchain_google_genai import ChatGoogleGenerativeAI
+from langgraph.errors import GraphRecursionError
 from langgraph.graph import StateGraph, START
 from langgraph.graph.message import add_messages
 from langgraph.prebuilt import ToolNode, tools_condition
@@ -38,7 +43,11 @@ from planner import (
     SearchExecutionInstruction,
     SearchPlan,
     _invoke_with_transient_retry,
+    build_chat_llm,
     create_search_plan,
+    fallback_search_plan,
+    set_planner_model,
+    strip_schedule_phrases,
 )
 from scheduler import (
     JobRegistry,
@@ -48,12 +57,17 @@ from scheduler import (
     _extract_content,
     console_print,
     format_jobs_table,
+    prompt_state,
 )
 from tools_search import search_tool
 from ragtool import retrieve_active_chunks
 
 load_dotenv()
-logging.basicConfig(level=logging.WARNING, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+
+# Guard rails for the agent loop and CLI robustness.
+CHAT_RECURSION_LIMIT = 10
+MAX_CONTEXT_TOKENS = 10000
+MAX_LOG_CHARS = 100_000
 
 
 # ---- Backward-compatible constants -------------------------------------------
@@ -69,10 +83,7 @@ MAX_AUTO_RUNS = config.MAX_AUTO_RUNS
 
 # ---- LLM ---------------------------------------------------------------------
 
-llm = ChatGoogleGenerativeAI(
-    model=config.GEMINI_MODEL,
-    google_api_key=config.GEMINI_API_KEY,
-)
+llm = build_chat_llm()
 
 
 # ---- Tools -------------------------------------------------------------------
@@ -85,6 +96,7 @@ def calculator(first_num: float, second_num: float, operation: str) -> dict:
     Supported operations: add, sub, mul, div.
     """
     try:
+        operation = (operation or "").strip().lower()
         if operation == "add":
             result = first_num + second_num
         elif operation == "sub":
@@ -110,7 +122,7 @@ def calculator(first_num: float, second_num: float, operation: str) -> dict:
 @tool
 def get_time() -> str:
     """Return the current local time in YYYY-MM-DD HH:mm:ss format."""
-    return arrow.now().format("YYYY-MM-DD HH:mm:ss")
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
 
 @tool
@@ -195,26 +207,82 @@ SCHEDULED_RUN_INSTRUCTIONS = (
 )
 
 agent_tools = [get_stock_price, search_tool, calculator, get_rag_chunks, get_time]
-tools = list(agent_tools)
 
-llm_with_tools = llm.bind_tools(tools)
+llm_with_tools = llm.bind_tools(agent_tools)
 scheduled_llm_with_tools = llm.bind_tools(agent_tools)
 
 
 def set_chatbot_model(model: str) -> None:
     """Switch the active chat model at runtime.
 
-    Rebuilds the tool-bound LLM and reassigns the module globals. The compiled
-    graph reads these globals on every invocation, so both interactive chat
-    and scheduled runs pick up the new model immediately.
+    Rebuilds the tool-bound LLM and the planner LLM, then reassigns the module
+    globals. The compiled graph reads these globals on every invocation, so
+    both interactive chat and scheduled runs pick up the new model immediately.
     """
     global llm, llm_with_tools, scheduled_llm_with_tools
-    llm = ChatGoogleGenerativeAI(
-        model=model,
-        google_api_key=config.GEMINI_API_KEY,
-    )
-    llm_with_tools = llm.bind_tools(tools)
+    llm = build_chat_llm(model)
+    llm_with_tools = llm.bind_tools(agent_tools)
     scheduled_llm_with_tools = llm.bind_tools(agent_tools)
+    set_planner_model(model)
+
+
+def _message_text(message: BaseMessage) -> str:
+    """Flatten a message's content (string or block list) to plain text."""
+    content = message.content
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for block in content:
+            if isinstance(block, str):
+                parts.append(block)
+            elif isinstance(block, dict):
+                parts.append(str(block.get("text", "")))
+            else:
+                parts.append(str(block))
+        return "".join(parts)
+    return str(content)
+
+
+def _rough_token_count(messages: list[BaseMessage]) -> int:
+    """Approximate token count without a tokenizer (~4 chars per token)."""
+    total = 0
+    for message in messages:
+        total += max(1, len(_message_text(message)) // 4) + 2
+    return total
+
+
+def _trim_for_invoke(messages: list[BaseMessage]) -> list[BaseMessage]:
+    """Bound the invocation context to MAX_CONTEXT_TOKENS.
+
+    History is trimmed per-invocation only; the LangGraph state keeps the full
+    conversation, so trimming never loses information from the user's session.
+    """
+    if _rough_token_count(messages) <= MAX_CONTEXT_TOKENS:
+        return list(messages)
+    try:
+        trimmed = trim_messages(
+            messages,
+            token_counter=_rough_token_count,
+            max_tokens=MAX_CONTEXT_TOKENS,
+            strategy="last",
+            start_on="human",
+            include_system=True,
+            allow_partial=False,
+        )
+    except Exception:  # noqa: BLE001 - trimming must never block the chat
+        system = [m for m in messages if isinstance(m, SystemMessage)]
+        rest = [m for m in messages if not isinstance(m, SystemMessage)]
+        return system + rest[-20:]
+    return list(trimmed)
+
+
+def _is_scheduled_run(messages: list[BaseMessage]) -> bool:
+    """True when this invocation came from the scheduler (not interactive chat)."""
+    for message in messages:
+        if isinstance(message, SystemMessage) and _message_text(message).strip() == SCHEDULED_RUN_INSTRUCTIONS:
+            return True
+    return False
 
 
 class ChatState(TypedDict):
@@ -223,12 +291,8 @@ class ChatState(TypedDict):
 
 def chat_node(state: ChatState):
     """LLM node that may answer or request a tool call."""
-    messages = state["messages"]
-    is_scheduled_run = any(
-        isinstance(m, SystemMessage) and m.content == SCHEDULED_RUN_INSTRUCTIONS
-        for m in messages
-    )
-    selected = scheduled_llm_with_tools if is_scheduled_run else llm_with_tools
+    messages = _trim_for_invoke(state["messages"])
+    selected = scheduled_llm_with_tools if _is_scheduled_run(messages) else llm_with_tools
     return {
         "messages": [
             _invoke_with_transient_retry(lambda: selected.invoke(messages))
@@ -236,7 +300,7 @@ def chat_node(state: ChatState):
     }
 
 
-tool_node = ToolNode(tools)
+tool_node = ToolNode(agent_tools)
 
 graph = StateGraph(ChatState)
 graph.add_node("chat_node", chat_node)
@@ -261,27 +325,7 @@ def _sanitize_prompt_for_scheduled_run(prompt: str, search_query: str) -> str:
     task words. If the resulting prompt looks empty or trivial, fall back to
     the planner's cleaned `search_query`.
     """
-    import re
-    text = prompt
-    # Remove "every N minutes/hours/days" phrases.
-    text = re.sub(
-        r"\b(?:for\s+)?(?:every|each)\s+\S+\s*"
-        r"(?:seconds?|secs?|minutes?|mins?|hours?|hrs?|days?)\b",
-        " ", text, flags=re.IGNORECASE,
-    )
-    # Remove "for N times/runs/checks".
-    text = re.sub(
-        r"\b(?:for\s+)?\S+\s*(?:times?|runs?|checks?|iterations?)\b",
-        " ", text, flags=re.IGNORECASE,
-    )
-    # Remove standalone scheduling words.
-    text = re.sub(
-        r"\b(?:hourly|daily|weekly|monthly|repeatedly|periodically|recurring|"
-        r"repeat|monitor|refresh|schedule|at\s+\d{1,2}(?::\d{2})?\s*(?:am|pm)?|"
-        r"tomorrow|tonight|in\s+\d+\s+(?:minutes?|mins?|hours?|hrs?))\b",
-        " ", text, flags=re.IGNORECASE,
-    )
-    text = re.sub(r"\s+", " ", text).strip(" ,.!?")
+    text = strip_schedule_phrases(prompt)
     # If we stripped too much, fall back to the planner's search_query.
     if len(text.split()) < 2:
         return search_query
@@ -336,7 +380,20 @@ def _build_messages(prompt: str, search_query: str, task_type: str = "search",
 
 
 def _invoke_chatbot(state: dict) -> dict:
-    return chatbot.invoke(state)
+    """Invoke the compiled graph with an explicit recursion limit.
+
+    A `TypeError` fallback keeps strict test doubles (which only accept
+    `state`) working unchanged. `GraphRecursionError` propagates so callers
+    can surface a polite "too many tool calls" message.
+    """
+    try:
+        return chatbot.invoke(
+            state, config={"recursion_limit": CHAT_RECURSION_LIMIT}
+        )
+    except TypeError:
+        return chatbot.invoke(state)
+    except GraphRecursionError:
+        raise
 
 
 scheduler = Scheduler(
@@ -402,41 +459,39 @@ def _handle_command(command: str) -> bool:
         console_print(COMMAND_HELP.strip())
     elif verb == "/jobs":
         console_print(format_jobs_table(_registry.all()))
-    elif verb == "/cancel" and arg:
-        job = _registry.get(arg)
-        if not job:
-            console_print(f"No job with id {arg!r}.")
+    elif verb in ("/cancel", "/pause", "/resume", "/logs"):
+        if not arg:
+            console_print(f"Usage: {verb} <job-id>. Run /jobs to list ids.")
         else:
-            job.stop()
-            console_print(f"Cancellation requested for job {arg}.")
-    elif verb == "/pause" and arg:
-        job = _registry.get(arg)
-        if not job:
-            console_print(f"No job with id {arg!r}.")
-        else:
-            job.pause()
-            _registry.update(job)
-            console_print(f"Paused job {arg}.")
-    elif verb == "/resume" and arg:
-        job = _registry.get(arg)
-        if not job:
-            console_print(f"No job with id {arg!r}.")
-        else:
-            job.resume()
-            _registry.update(job)
-            console_print(f"Resumed job {arg}.")
-    elif verb == "/logs" and arg:
-        job = _registry.get(arg)
-        if not job:
-            console_print(f"No job with id {arg!r}.")
-        else:
-            history_dir = _registry.history_path(arg)
-            files = sorted(history_dir.glob("run-*.json"))
-            if not files:
-                console_print(f"No runs recorded yet for job {arg}.")
-            else:
-                console_print(f"--- Last run for job {arg} ({files[-1].name}) ---")
-                console_print(files[-1].read_text(encoding="utf-8"))
+            job = _registry.get(arg)
+            if not job:
+                console_print(f"No job with id {arg!r}.")
+            elif verb == "/cancel":
+                job.stop()
+                console_print(f"Cancellation requested for job {arg}.")
+            elif verb == "/pause":
+                job.pause()
+                _registry.update(job)
+                console_print(f"Paused job {arg}.")
+            elif verb == "/resume":
+                job.resume()
+                _registry.update(job)
+                console_print(f"Resumed job {arg}.")
+            else:  # /logs
+                history_dir = _registry.history_path(arg)
+                files = sorted(history_dir.glob("run-*.json"))
+                if not files:
+                    console_print(f"No runs recorded yet for job {arg}.")
+                else:
+                    try:
+                        content = files[-1].read_text(encoding="utf-8")
+                    except OSError as exc:
+                        console_print(f"Could not read the run log for job {arg}: {exc}")
+                    else:
+                        if len(content) > MAX_LOG_CHARS:
+                            content = content[:MAX_LOG_CHARS] + "\n... (truncated)"
+                        console_print(f"--- Last run for job {arg} ({files[-1].name}) ---")
+                        console_print(content)
     elif verb == "/clear":
         removed = 0
         for job in _registry.all():
@@ -450,20 +505,47 @@ def _handle_command(command: str) -> bool:
 
 
 def _run_one_off(user_input: str, plan: SearchPlan) -> None:
-    """Invoke the chatbot once with the planner-chosen query."""
-    out = chatbot.invoke(
-        {
-            "messages": [
-                SystemMessage(content=SearchExecutionInstruction(plan.search_query).render()),
-                HumanMessage(content=user_input),
-            ]
-        }
-    )
+    """Invoke the chatbot once with the planner-chosen query and task routing."""
+    if plan.task_type == "reminder":
+        instruction = ReminderExecutionInstruction(plan.reminder_text or plan.search_query)
+    elif plan.task_type == "calculation":
+        instruction = CalculationExecutionInstruction(plan.search_query)
+    elif plan.task_type == "rag":
+        instruction = RagExecutionInstruction(plan.search_query)
+    elif plan.task_type == "chat":
+        instruction = ChatExecutionInstruction(plan.search_query)
+    else:
+        instruction = SearchExecutionInstruction(plan.search_query)
+    try:
+        out = _invoke_chatbot(
+            {
+                "messages": [
+                    SystemMessage(content=instruction.render()),
+                    HumanMessage(content=user_input),
+                ]
+            }
+        )
+    except GraphRecursionError:
+        console_print(
+            "Assistant: stopped after "
+            f"{CHAT_RECURSION_LIMIT} tool calls; try rephrasing."
+        )
+        return
     console_print(f"Assistant: {_extract_content(out)}")
 
 
 def run_cli() -> None:
     """Run the interactive client with LLM-selected search scheduling."""
+    logging.basicConfig(
+        level=logging.WARNING,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    )
+    if not config.GEMINI_API_KEY:
+        console_print(
+            "GEMINI_API_KEY is not configured. Add it to .env (or export it) and restart."
+        )
+        return
+
     console_print("Chatbot is ready. Type /help for commands, or 'exit' to quit.")
 
     # Resume any schedules persisted from previous sessions.
@@ -473,6 +555,8 @@ def run_cli() -> None:
         console_print(format_jobs_table(restored))
 
     try:
+        prompt_state["enabled"] = True
+        prompt_state["text"] = "You: "
         while True:
             try:
                 user_input = input("You: ").strip()
@@ -491,13 +575,8 @@ def run_cli() -> None:
             try:
                 plan = create_search_plan(user_input)
             except Exception as exc:  # noqa: BLE001
-                console_print(f"Planner error: {exc}. Falling back to a single run.")
-                plan = SearchPlan(
-                    search_query=user_input,
-                    should_schedule=False,
-                    wait_minutes=0.0,
-                    run_count=1,
-                )
+                console_print(f"Planner error: {exc}. Using local fallback.")
+                plan = fallback_search_plan(user_input)
 
             start_msg = (
                 f"Planned search: {plan.search_query!r}; "
@@ -511,7 +590,7 @@ def run_cli() -> None:
                 try:
                     job = scheduler.start(
                         prompt=user_input,
-                        interval_minutes=plan.wait_minutes or None,
+                        interval_minutes=plan.wait_minutes if plan.wait_minutes else None,
                         run_count=plan.run_count,
                         search_query=plan.search_query,
                         absolute_start_iso=plan.absolute_start_iso,
@@ -531,10 +610,17 @@ def run_cli() -> None:
     except KeyboardInterrupt:
         console_print("\nInterrupt received; cancelling active schedules.")
     finally:
+        prompt_state["enabled"] = False
         for job in _registry.active():
             job.stop()
+        exit_deadline = time.monotonic() + 5.0
         for job in _registry.active():
-            job.join(timeout=2)
+            job.join(timeout=max(0.0, exit_deadline - time.monotonic()))
+        for job in _registry.active():
+            if not job.done:
+                job.status = "cancelled"
+                job.error_message = job.error_message or "Interrupted at shutdown."
+                _registry.update(job)
 
 
 if __name__ == "__main__":

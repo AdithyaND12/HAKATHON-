@@ -177,14 +177,14 @@ def test_index_pdf_skips_reindexing_when_unchanged(monkeypatch, tmp_path):
 
 def test_index_pdf_rebuilds_when_embedding_model_changed(monkeypatch, tmp_path):
     """Vectors from a different embedding model are incompatible: an old-style
-    marker (e.g. written by the previous Gemini embedding setup) must trigger a
+    marker (e.g. written by a previous embedding provider) must trigger a
     full rebuild instead of a silent skip."""
     pdf = tmp_path / "doc.pdf"
     pdf.write_bytes(b"%PDF-1.7\nfake bytes\n")
     sha = ragtool._pdf_hash(pdf)
     collection = ragtool.collection_name_for_sha(sha)
     (tmp_path / f".marker_{collection}").write_text(
-        f"gemini-embedding-001\n{sha}", encoding="utf-8"
+        f"some-other-embedding-model\n{sha}", encoding="utf-8"
     )
 
     store = _FakeVectorstore(count=1)
@@ -415,6 +415,8 @@ def test_marker_includes_pipeline_version(monkeypatch):
 
 
 def test_daily_quota_exhaustion_is_detected():
+    # Mirrors Jina's actual free-tier error text (their free endpoint is
+    # Gemini-backed, so the message references a Gemini model).
     daily = (
         "429 RESOURCE_EXHAUSTED. Quota exceeded for metric: "
         "generativelanguage.googleapis.com/embed_content_free_tier_requests, "

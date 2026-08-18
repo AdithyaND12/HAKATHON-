@@ -10,8 +10,9 @@ Key design points:
       is untouched and stays a Gemini model.
     * Index markers record BOTH the embedding model and the PDF sha256, so
       switching embedding models automatically invalidates the old vectors
-      (Gemini embeddings are a different dimension and incompatible with a
-      Chroma collection built by Jina) and triggers a safe rebuild.
+      (vectors from a different model have a different dimension and are
+      incompatible with a Chroma collection built by Jina) and triggers a safe
+      rebuild.
     * Import from `langchain_chroma` when available; fall back to the
       deprecated `langchain_community.vectorstores.Chroma` so existing
       environments do not break.
@@ -248,7 +249,7 @@ def _pdf_hash(pdf_path: Path) -> str:
 
 
 def _is_transient_api_error(exc: BaseException) -> bool:
-    """True for Gemini rate-limit / server-side errors that warrant a retry."""
+    """True for provider rate-limit / server-side errors that warrant a retry."""
     text = str(exc)
     return bool(
         re.search(r"\b(?:429|50[0-9])\b", text)
@@ -348,8 +349,8 @@ INDEX_PIPELINE_VERSION = 2
 def _expected_marker(pdf_sha256: str) -> str:
     """Marker content = embedding model + pipeline version + pdf hash.
 
-    Including the model means switching embedding models (Gemini → Jina, or a
-    future Jina model change) invalidates every old collection automatically,
+    Including the model means switching to a different embedding model or
+    provider invalidates every old collection automatically,
     since vectors from a different model/dimension are incompatible. The
     pipeline version additionally invalidates collections whose vectors were
     produced by an older chunking/contextualization logic.

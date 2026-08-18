@@ -35,11 +35,21 @@ log = logging.getLogger(__name__)
 
 _console_lock = threading.Lock()
 
+# Interactive-CLI hook: when the CLI is parked at an input prompt, every
+# scheduler line re-renders the prompt so job output never lands mid-line.
+prompt_state = {"enabled": False, "text": "You: "}
+
 
 def console_print(*args: Any, **kwargs: Any) -> None:
-    """Thread-safe print used by every scheduler line."""
+    """Thread-safe print used by every scheduler line.
+
+    When the interactive CLI has enabled `prompt_state`, each line is followed
+    by a redrawn prompt so job output does not interleave with user input.
+    """
     with _console_lock:
         print(*args, **kwargs, flush=True)
+        if prompt_state["enabled"]:
+            print("\r" + prompt_state["text"], end="", flush=True)
 
 
 def console_lock() -> threading.Lock:
@@ -349,7 +359,11 @@ class Scheduler:
         return job
 
     def resume_persisted(self) -> list[ScheduledSearchJob]:
-        """Reload jobs from disk and resume any that were not finished."""
+        """Reload jobs from disk and resume any that were not finished.
+
+        Jobs with a future `next_run_at` are re-armed to wait out the
+        remaining interval instead of firing immediately on restart.
+        """
         restored: list[ScheduledSearchJob] = []
         for saved in self.registry.load_persisted():
             if saved.status in ("completed", "cancelled", "failed"):
@@ -360,6 +374,14 @@ class Scheduler:
             saved.stop_event = threading.Event()
             saved.pause_event = threading.Event()
             saved.done_event = threading.Event()
+            if saved.next_run_at and not saved.absolute_start_iso:
+                try:
+                    next_run = datetime.fromisoformat(saved.next_run_at)
+                except ValueError:
+                    next_run = None
+                if next_run is not None and next_run > datetime.now(timezone.utc):
+                    # Re-arm the worker to fire at the remaining instant.
+                    saved.absolute_start_iso = saved.next_run_at
             self.registry.register(saved)
             self._launch(saved)
             restored.append(saved)
@@ -441,6 +463,30 @@ class Scheduler:
         if job.absolute_start_iso is None:
             job.absolute_start_iso = plan.absolute_start_iso
 
+    def _hold_while_paused(self, job: ScheduledSearchJob) -> None:
+        """Block until the job is resumed or stopped."""
+        console_print(f"[{job.id}] Paused; waiting for /resume...")
+        while job.pause_event.is_set() and not job.stop_event.is_set():
+            job.stop_event.wait(0.05)
+
+    def _wait_between_runs(self, job: ScheduledSearchJob, seconds: float) -> bool:
+        """Wait `seconds` between runs, honoring /pause and /cancel.
+
+        Returns True when the wait completed normally; False on cancellation.
+        """
+        deadline = time.monotonic() + seconds
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return True
+            if job.pause_event.is_set():
+                self._hold_while_paused(job)
+                if job.stop_event.is_set():
+                    return False
+                continue
+            if job.stop_event.wait(min(remaining, 0.5)):
+                return False
+
     def _worker(self, job: ScheduledSearchJob) -> None:
         try:
             self._resolve_missing_fields(job)
@@ -467,8 +513,7 @@ class Scheduler:
                 # Pause: block here until resumed or cancelled.
                 if job.pause_event.is_set():
                     console_print(f"[{job.id}] Paused before run {run_number}.")
-                    while job.pause_event.is_set() and not job.stop_event.is_set():
-                        job.stop_event.wait(0.05)
+                    self._hold_while_paused(job)
 
                 if job.stop_event.is_set():
                     job.status = "cancelled"
@@ -526,7 +571,7 @@ class Scheduler:
                         f"[{job.id}] Waiting {interval:g} minute(s) before run "
                         f"{run_number + 1}/{runs}..."
                     )
-                    if job.stop_event.wait(interval * 60):
+                    if not self._wait_between_runs(job, interval * 60):
                         job.status = "cancelled"
                         console_print(f"[{job.id}] Cancelled during wait.")
                         self.registry.update(job)

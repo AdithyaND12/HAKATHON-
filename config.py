@@ -27,6 +27,8 @@ GEMINI_MODEL_OPTIONS = {
     "Gemini 3.5 Flash-Lite": "gemini-3.5-flash-lite",
     "Gemini 3.1 Flash-Lite": "gemini-3.1-flash-lite",
     "Gemini 3.5 Flash": "gemini-3.5-flash",
+    "Gemma 4 31B IT": "gemma-4-31b-it",
+    "Gemma 4 26B MoE IT": "gemma-4-26b-a4b-it",
 }
 DEFAULT_HTTP_TIMEOUT_SECONDS = 10.0
 DEFAULT_WAIT_MAX_SECONDS = 3600.0
