@@ -32,10 +32,12 @@ from __future__ import annotations
 import asyncio
 import atexit
 import concurrent.futures
+import json
 import logging
 import os
 import shlex
 import threading
+from pathlib import Path
 from typing import Optional
 
 import config
@@ -104,6 +106,46 @@ _teardown_future: Optional[concurrent.futures.Future] = None  # host finished
 _tools_cache: Optional[list] = None  # one-time load per process
 
 
+# OAuth material lives in ~/.gmail-mcp/ (the server's default config dir).
+_GMAIL_MCP_CONFIG_DIR = Path.home() / ".gmail-mcp"
+
+
+def _materialize_oauth_files() -> None:
+    """Write OAuth credentials from Streamlit secrets (cloud deployments).
+
+    On Streamlit Cloud there is no ~/.gmail-mcp/, so the two JSON files the
+    server expects are materialized from `st.secrets` when present:
+
+        [gmail_oauth_keys]   -> gcp-oauth.keys.json  (the "installed" client)
+        [gmail_credentials]  -> credentials.json     (cached token)
+
+    No-ops outside Streamlit or when the secrets keys are absent; failures are
+    logged and swallowed so the rest of the app keeps working.
+    """
+    try:
+        import streamlit as st
+
+        secrets = st.secrets
+    except Exception:  # noqa: BLE001 - not running under Streamlit
+        return
+    mapping = {
+        "gmail_oauth_keys": _GMAIL_MCP_CONFIG_DIR / "gcp-oauth.keys.json",
+        "gmail_credentials": _GMAIL_MCP_CONFIG_DIR / "credentials.json",
+    }
+    for key, path in mapping.items():
+        try:
+            if key not in secrets:
+                continue
+            payload = json.dumps(dict(secrets[key]), indent=2)
+            if path.exists() and path.read_text() == payload:
+                continue
+            _GMAIL_MCP_CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+            path.write_text(payload)
+            logger.info("Wrote %s from Streamlit secrets", path)
+        except Exception as exc:  # noqa: BLE001 - fail-open by design
+            logger.warning("Could not materialize %s from secrets: %s", path, exc)
+
+
 def init_gmail_tools() -> list:
     """Return the adapted Gmail LangChain tools, or [] if unavailable.
 
@@ -116,6 +158,7 @@ def init_gmail_tools() -> list:
         return []
     if _tools_cache is not None:
         return list(_tools_cache)
+    _materialize_oauth_files()
     _ensure_loop_thread()
     try:
         ready, teardown = concurrent.futures.Future(), concurrent.futures.Future()

@@ -305,6 +305,31 @@ chroma_stores/       Vector stores (one dir per embedding model) — git-ignored
   continues without email tools. The agent is prompted to confirm before
   sending or permanently deleting messages — but treat `send_message` /
   `delete_message` as real actions, because they are.
+- **Gmail on Streamlit Cloud**: the container has no `~/.gmail-mcp/` and no
+  cloned server, so two extra steps are needed. (1) Node is installed via
+  `packages.txt`, and gmail-mcp runs from npm (`npx @shinzolabs/gmail-mcp`) —
+  this happens automatically when the local build path doesn't exist. (2) Put
+  your OAuth material in the app's Secrets so it can be authorized without an
+  interactive browser flow on the cloud machine:
+  run `npx -y @shinzolabs/gmail-mcp auth` **locally** once, then copy the two
+  generated files into Streamlit Cloud → App settings → Secrets:
+
+  ```toml
+  GMAIL_MCP_ENABLED = "true"
+
+  [gmail_oauth_keys]
+  # full contents of ~/.gmail-mcp/gcp-oauth.keys.json
+  installed = { client_id = "...", client_secret = "...", ... }
+
+  [gmail_credentials]
+  # full contents of ~/.gmail-mcp/credentials.json
+  access_token = "..."
+  refresh_token = "..."
+  ```
+
+  At startup the app writes these to `~/.gmail-mcp/` before spawning the MCP
+  server. If the cached token expires, re-run the local auth and update the
+  secrets.
 - **Gemini authentication error**: confirm `GEMINI_API_KEY` is set correctly in
   your `.env`.
 - **Embedding API error (RAG)**: confirm `JINA_API_KEY` is set correctly in your

@@ -119,11 +119,16 @@ SEARCH_RETRY_BACKOFF_SECONDS = env_float("SEARCH_RETRY_BACKOFF_SECONDS", 2.0)
 # default so the test suite never spawns a Node subprocess; set
 # GMAIL_MCP_ENABLED=true to opt in.
 GMAIL_MCP_ENABLED = env_str("GMAIL_MCP_ENABLED", "false").lower() in {"1", "true", "yes", "on"}
-GMAIL_MCP_COMMAND = env_str("GMAIL_MCP_COMMAND", "node")
-GMAIL_MCP_ARGS = env_str(
-    "GMAIL_MCP_ARGS",
-    "/Users/adithya/agent2/gmail-mcp/dist/index.js",
-)
+# Locally the cloned gmail-mcp build is used; elsewhere (e.g. Streamlit Cloud,
+# where that path does not exist) fall back to the published npm package via
+# npx. Explicit GMAIL_MCP_COMMAND / GMAIL_MCP_ARGS always win.
+_GMAIL_MCP_LOCAL_DIST = Path("/Users/adithya/agent2/gmail-mcp/dist/index.js")
+if _GMAIL_MCP_LOCAL_DIST.exists():
+    GMAIL_MCP_COMMAND = env_str("GMAIL_MCP_COMMAND", "node")
+    GMAIL_MCP_ARGS = env_str("GMAIL_MCP_ARGS", str(_GMAIL_MCP_LOCAL_DIST))
+else:
+    GMAIL_MCP_COMMAND = env_str("GMAIL_MCP_COMMAND", "npx")
+    GMAIL_MCP_ARGS = env_str("GMAIL_MCP_ARGS", "-y @shinzolabs/gmail-mcp")
 # The gmail-mcp server always binds its HTTP listener; port "0" lets the OS
 # assign a free one so instances never clash (a fixed value would collide
 # with orphaned servers). Override only when you know no other instance runs.
