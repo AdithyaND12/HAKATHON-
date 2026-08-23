@@ -115,6 +115,43 @@ DUCKDUCKGO_REGION = env_str("DUCKDUCKGO_REGION", "us-en")
 SEARCH_MAX_RETRIES = env_int("SEARCH_MAX_RETRIES", 3)
 SEARCH_RETRY_BACKOFF_SECONDS = env_float("SEARCH_RETRY_BACKOFF_SECONDS", 2.0)
 
+# Gmail MCP integration (inbox read + mailbox write tools). Disabled by
+# default so the test suite never spawns a Node subprocess; set
+# GMAIL_MCP_ENABLED=true to opt in.
+GMAIL_MCP_ENABLED = env_str("GMAIL_MCP_ENABLED", "false").lower() in {"1", "true", "yes", "on"}
+GMAIL_MCP_COMMAND = env_str("GMAIL_MCP_COMMAND", "node")
+GMAIL_MCP_ARGS = env_str(
+    "GMAIL_MCP_ARGS",
+    "/Users/adithya/agent2/gmail-mcp/dist/index.js",
+)
+# The gmail-mcp server always binds its HTTP listener; port "0" lets the OS
+# assign a free one so instances never clash (a fixed value would collide
+# with orphaned servers). Override only when you know no other instance runs.
+GMAIL_MCP_PORT = env_str("GMAIL_MCP_PORT", "0")
+
+# Waggle MCP memory integration: persistent graph memory (decisions,
+# preferences, project facts) shared across conversations and sessions.
+# Disabled by default so the test suite never spawns a subprocess; set
+# WAGGLE_MCP_ENABLED=true to opt in. The memory DB lives under the data dir.
+WAGGLE_MCP_ENABLED = env_str("WAGGLE_MCP_ENABLED", "false").lower() in {"1", "true", "yes", "on"}
+WAGGLE_MCP_COMMAND = env_str("WAGGLE_MCP_COMMAND", "waggle-mcp")
+WAGGLE_MCP_ARGS = env_str("WAGGLE_MCP_ARGS", "")
+# Embeddings ride on the same free Jina API as the PDF RAG (JINA_API_KEY
+# above), so no local model download happens. "pytorch" / "onnx" / "jina"
+# are supported; "deterministic" needs no key at all (weaker retrieval).
+WAGGLE_EMBEDDING_BACKEND = env_str("WAGGLE_EMBEDDING_BACKEND", "jina")
+WAGGLE_MODEL = env_str("WAGGLE_MODEL", "jina-embeddings-v4")
+WAGGLE_EMBEDDING_DIMENSIONS = env_int("WAGGLE_EMBEDDING_DIMENSIONS", 768)
+WAGGLE_DB_PATH = env_path("WAGGLE_DB_PATH", DATA_DIR / "waggle" / "memory.db")
+# Memory scope used for every recall/store; keeps HAKATHON memory separate
+# from any other Waggle tenants on this machine.
+WAGGLE_PROJECT = env_str("WAGGLE_PROJECT", "hakathon")
+WAGGLE_AGENT_ID = env_str("WAGGLE_AGENT_ID", "hakathon-chat")
+# Cap per-call timeouts across the bridge thread. observe_conversation runs a
+# local LLM extraction step and can be slow on first use (model warm-up).
+WAGGLE_CALL_TIMEOUT_SECONDS = env_float("WAGGLE_CALL_TIMEOUT_SECONDS", 300.0)
+WAGGLE_OUTPUT_MAX_CHARS = env_int("WAGGLE_OUTPUT_MAX_CHARS", 4000)
+
 
 def ensure_data_dir() -> Path:
     """Create the data directory if it does not exist and return it."""

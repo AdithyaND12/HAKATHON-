@@ -58,6 +58,7 @@ except ImportError:  # pragma: no cover - only hit when the optional dep is miss
 import config
 import ragtool
 from app import _registry, chatbot, llm, scheduler, set_chatbot_model
+from waggle_tools import WAGGLE_MEMORY_POLICY, memorize_turn, prime_session
 from planner import SearchExecutionInstruction, SearchPlan, create_search_plan
 from scheduler import (
     ScheduleValidationError,
@@ -476,8 +477,9 @@ def _persist_conversations(conversations: dict, active_conv: "str | None", job_c
 
 def _create_conversation(conversations: dict) -> str:
     """Add a fresh empty conversation and return its id."""
-    conv_id = uuid.uuid4().hex[:12]
+    conv_id = str(uuid.uuid4())[:8]
     conversations[conv_id] = {"title": "new chat", "messages": []}
+    prime_session(conv_id)
     return conv_id
 
 
@@ -678,6 +680,8 @@ def _build_llm_messages(prompt: str, plan: SearchPlan, history: list[dict]) -> l
     (RAG source label or raw document, plus the planner's search instruction),
     the trimmed prior conversation, then the user's current prompt."""
     system_messages: list[SystemMessage] = []
+    if config.WAGGLE_MCP_ENABLED:
+        system_messages.append(SystemMessage(content=WAGGLE_MEMORY_POLICY))
     if st.session_state.get("rag_mode", True):
         # RAG on: tell the LLM which uploaded document the RAG tool can see so
         # it reaches for get_rag_chunks when the question targets that PDF.
@@ -1319,6 +1323,15 @@ if prompt:
             if not reply:
                 reply = "_(no response — the model returned nothing; details logged)_"
             placeholder.markdown(reply)
+            # Store the turn into Waggle memory (best-effort, no-op when off).
+            # Skip error banners and empty placeholder replies.
+            if reply and not reply.startswith("⚠️"):
+                memorize_turn(
+                    prompt,
+                    reply,
+                    session_id=st.session_state.active_conv,
+                    block=False,
+                )
             if usage:
                 st.caption(
                     " · ".join(

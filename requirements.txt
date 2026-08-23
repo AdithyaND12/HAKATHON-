@@ -10,6 +10,9 @@ langchain-core
 langchain-google-genai
 langchain-text-splitters
 langgraph
+# mcp >=2 is required by waggle-mcp (langchain-mcp-adapters pins <2 and is
+# no longer used — bridges drive the mcp client directly via mcp_tool_bridge).
+mcp>=2.0.0,<3.0.0
 pydantic
 pymupdf
 python-dotenv
@@ -19,6 +22,10 @@ streamlit-autorefresh
 fastapi
 uvicorn
 python-multipart
+# Waggle memory. NOTE: the local dev checkout at ../Waggle-mcp carries an
+# unpushed Jina embedding-backend patch; cloud installs get PyPI waggle-mcp,
+# so keep WAGGLE_MCP_ENABLED=false unless that patch lands upstream.
+waggle-mcp
 
 # Test-only
 pytest
