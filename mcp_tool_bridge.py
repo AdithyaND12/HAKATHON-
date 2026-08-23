@@ -71,6 +71,15 @@ def _args_model_from_schema(schema: Optional[dict]) -> Optional[type[BaseModel]]
         return None
 
 
+def _strip_nones(value: Any) -> Any:
+    """Recursively drop null values; zod rejects explicit nulls for optionals."""
+    if isinstance(value, dict):
+        return {k: _strip_nones(v) for k, v in value.items() if v is not None}
+    if isinstance(value, list):
+        return [_strip_nones(v) for v in value if v is not None]
+    return value
+
+
 class McpTool:
     """An mcp server tool callable as `await tool.ainvoke(arguments)`."""
 
@@ -88,7 +97,7 @@ class McpTool:
         """Invoke this tool on the session; returns flattened text."""
         if self._invoke is None:
             raise RuntimeError(f"Tool {self.name!r} is not session-bound")
-        filtered = {k: v for k, v in arguments.items() if v is not None}
+        filtered = _strip_nones(arguments)
         result = await self._invoke(filtered)
         return flatten_mcp_result(result)
 

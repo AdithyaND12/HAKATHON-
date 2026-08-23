@@ -59,7 +59,16 @@ import config
 import ragtool
 from app import _registry, chatbot, llm, scheduler, set_chatbot_model
 from waggle_tools import WAGGLE_MEMORY_POLICY, memorize_turn, prime_session
-from planner import SearchExecutionInstruction, SearchPlan, create_search_plan
+from planner import (
+    CalculationExecutionInstruction,
+    ChatExecutionInstruction,
+    EmailExecutionInstruction,
+    RagExecutionInstruction,
+    ReminderExecutionInstruction,
+    SearchExecutionInstruction,
+    SearchPlan,
+    create_search_plan,
+)
 from scheduler import (
     ScheduleValidationError,
     _content_to_text,
@@ -702,9 +711,19 @@ def _build_llm_messages(prompt: str, plan: SearchPlan, history: list[dict]) -> l
                     )
                 )
             )
-    system_messages.append(
-        SystemMessage(content=SearchExecutionInstruction(plan.search_query).render())
-    )
+    if plan.task_type == "reminder":
+        instruction = ReminderExecutionInstruction(plan.reminder_text or plan.search_query)
+    elif plan.task_type == "calculation":
+        instruction = CalculationExecutionInstruction(plan.search_query)
+    elif plan.task_type == "rag":
+        instruction = RagExecutionInstruction(plan.search_query)
+    elif plan.task_type == "chat":
+        instruction = ChatExecutionInstruction(plan.search_query)
+    elif plan.task_type == "email":
+        instruction = EmailExecutionInstruction(plan.search_query)
+    else:
+        instruction = SearchExecutionInstruction(plan.search_query)
+    system_messages.append(SystemMessage(content=instruction.render()))
     return system_messages + _history_to_langchain(history) + [HumanMessage(content=prompt)]
 
 
