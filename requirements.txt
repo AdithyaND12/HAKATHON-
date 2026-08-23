@@ -22,10 +22,10 @@ streamlit-autorefresh
 fastapi
 uvicorn
 python-multipart
-# Waggle memory. NOTE: the local dev checkout at ../Waggle-mcp carries an
-# unpushed Jina embedding-backend patch; cloud installs get PyPI waggle-mcp,
-# so keep WAGGLE_MCP_ENABLED=false unless that patch lands upstream.
-waggle-mcp
+# Waggle memory server is NOT installed here: it's a subprocess launched only
+# when WAGGLE_MCP_ENABLED=true, and its dependency chain (sentence-transformers
+# -> torch, etc.) exceeds Streamlit Cloud's build resources. Install it locally:
+#   pipx install waggle-mcp   (requires Python 3.11+)
 
 # Test-only
 pytest
