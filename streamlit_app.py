@@ -364,6 +364,89 @@ html, body, [data-testid="stAppViewContainer"] {
 
 /* Selected text */
 ::selection { background: var(--accent); color: var(--bg-0); }
+
+/* ---- Responsive: desktop (wider column for long answers/code) --------------- */
+@media (min-width: 1024px) {
+    [data-testid="stMainBlockContainer"] {
+        max-width: 920px;
+    }
+    [data-testid="stChatMessageContent"] {
+        font-size: 1rem;
+    }
+}
+
+/* ---- Responsive: mobile ------------------------------------------------------
+   Touch-friendly sizes, no horizontal overflow, stacked schedule cards. */
+@media (max-width: 640px) {
+    .term-header {
+        font-size: 1.25rem;
+        padding-top: 0.25rem;
+    }
+    .term-sub {
+        font-size: 0.72rem;
+        padding-bottom: 0.75rem;
+    }
+
+    /* Slimmer gutters so content gets maximum width */
+    [data-testid="stMainBlockContainer"] {
+        padding-left: 0.75rem !important;
+        padding-right: 0.75rem !important;
+    }
+
+    /* Chat bubbles: tighter, never overflow */
+    [data-testid="stChatMessage"] > div:first-child {
+        padding: 0.55rem !important;
+        border-radius: 8px;
+        max-width: 100%;
+    }
+    [data-testid="stChatMessageContent"],
+    [data-testid="stMarkdownContainer"] {
+        overflow-wrap: break-word;
+        word-break: break-word;
+    }
+    [data-testid="stChatMessageContent"] pre {
+        overflow-x: auto;
+        -webkit-overflow-scrolling: touch;
+    }
+    [data-testid="stChatMessageContent"] code {
+        word-break: break-word;
+    }
+
+    /* Touch targets >= 44px; 16px input font prevents iOS focus-zoom */
+    [data-testid="stChatInput"] textarea {
+        min-height: 48px !important;
+        font-size: 1rem !important;
+    }
+    [data-testid="stChatInput"] button {
+        min-width: 44px;
+        min-height: 44px;
+    }
+    .stButton > button {
+        min-height: 44px;
+        font-size: 0.85rem;
+    }
+
+    /* Schedule cards: head stacks vertically instead of cramming one line */
+    .sched-card {
+        padding: 0.85rem 0.9rem;
+        border-radius: 8px;
+    }
+    .sched-card .sched-head {
+        flex-direction: column;
+        align-items: flex-start;
+        gap: 0.35rem;
+    }
+    .sched-card .sched-time { margin-left: 0; }
+
+    /* Status chips wrap instead of pushing the page sideways */
+    .sched-strip { gap: 0.4rem; margin-bottom: 0.5rem; }
+    .sched-chip { flex-wrap: wrap; row-gap: 0.15rem; }
+
+    .plan-line {
+        font-size: 0.68rem;
+        overflow-wrap: anywhere;
+    }
+}
 </style>
 """
 
