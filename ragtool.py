@@ -33,8 +33,14 @@ import pymupdf
 from chromadb import PersistentClient
 from chromadb.config import Settings
 from langchain_core.documents import Document
+from langchain_core.embeddings import Embeddings
 from langchain_community.embeddings import JinaEmbeddings
 from langchain_text_splitters import RecursiveCharacterTextSplitter
+
+try:
+    from langchain_google_genai import GoogleGenerativeAIEmbeddings
+except ImportError:  # pragma: no cover - optional dependency
+    GoogleGenerativeAIEmbeddings = None  # type: ignore[assignment,misc]
 
 import config
 
@@ -51,8 +57,11 @@ GEMINI_MODEL = config.GEMINI_MODEL
 GEMINI_API_KEY = config.GEMINI_API_KEY
 JINA_API_KEY = config.JINA_API_KEY
 JINA_EMBEDDING_MODEL = config.JINA_EMBEDDING_MODEL
+EMBEDDING_PROVIDER = config.EMBEDDING_PROVIDER
+GOOGLE_EMBEDDING_MODEL = config.GOOGLE_EMBEDDING_MODEL
 HTTP_TIMEOUT_SECONDS = config.HTTP_TIMEOUT_SECONDS
-EMBED_BATCH_SIZE = config.JINA_EMBEDDING_BATCH_SIZE
+JINA_EMBED_BATCH_SIZE = config.JINA_EMBEDDING_BATCH_SIZE
+GOOGLE_EMBED_BATCH_SIZE = config.GOOGLE_EMBEDDING_BATCH_SIZE
 
 
 def _model_slug(model_name: str) -> str:
@@ -66,12 +75,24 @@ def _model_slug(model_name: str) -> str:
 # new model's collections query-time-unusable. Namespacing means switching
 # embedding models can never touch another model's store.
 STORE_ROOT = Path(__file__).resolve().parent / "chroma_stores"
-PERSIST_DIRECTORY = STORE_ROOT / _model_slug(JINA_EMBEDDING_MODEL)
+# One persist directory PER embedding model: vectors from a different model
+# (different dimension) are incompatible. Namespacing by provider+model means
+# switching embedding models can never touch another model's store.
+def _active_model_slug() -> str:
+    if EMBEDDING_PROVIDER == "google":
+        return _model_slug(GOOGLE_EMBEDDING_MODEL)
+    return _model_slug(JINA_EMBEDDING_MODEL)
+
+PERSIST_DIRECTORY = STORE_ROOT / _active_model_slug()
 DEFAULT_QUERY = "the user's document"
 DEFAULT_TOP_K = 4
-# Chunks per embedding batch. JinaEmbeddings sends the whole batch in one POST,
-# so bigger batches mean fewer requests against the free tier's limits.
-EMBED_BATCH_SIZE = config.JINA_EMBEDDING_BATCH_SIZE
+
+
+def _embed_batch_size() -> int:
+    """Chunks per embedding batch, provider-aware."""
+    if EMBEDDING_PROVIDER == "google":
+        return GOOGLE_EMBED_BATCH_SIZE
+    return JINA_EMBED_BATCH_SIZE
 
 
 def _ocr_page(page) -> str:
@@ -202,7 +223,19 @@ def _split_documents(documents: list[Document]) -> list[Document]:
     return chunks
 
 
-def _get_embedding_model() -> JinaEmbeddings:
+def _get_embedding_model() -> Embeddings:
+    """Return the configured embedding model (Jina or Google)."""
+    if EMBEDDING_PROVIDER == "google":
+        if GoogleGenerativeAIEmbeddings is None:
+            raise ImportError(
+                "langchain-google-genai is required for Google embeddings. "
+                "Install it with: pip install langchain-google-genai"
+            )
+        return GoogleGenerativeAIEmbeddings(
+            model=GOOGLE_EMBEDDING_MODEL,
+            google_api_key=GEMINI_API_KEY,
+        )
+    # Default: Jina
     return JinaEmbeddings(
         model_name=JINA_EMBEDDING_MODEL,
         jina_api_key=JINA_API_KEY,
@@ -347,15 +380,16 @@ INDEX_PIPELINE_VERSION = 2
 
 
 def _expected_marker(pdf_sha256: str) -> str:
-    """Marker content = embedding model + pipeline version + pdf hash.
+    """Marker content = embedding provider + model + pipeline version + pdf hash.
 
-    Including the model means switching to a different embedding model or
-    provider invalidates every old collection automatically,
+    Including the provider and model means switching to a different embedding
+    model or provider invalidates every old collection automatically,
     since vectors from a different model/dimension are incompatible. The
     pipeline version additionally invalidates collections whose vectors were
     produced by an older chunking/contextualization logic.
     """
-    return f"{JINA_EMBEDDING_MODEL}\n{INDEX_PIPELINE_VERSION}\n{pdf_sha256}"
+    model = GOOGLE_EMBEDDING_MODEL if EMBEDDING_PROVIDER == "google" else JINA_EMBEDDING_MODEL
+    return f"{EMBEDDING_PROVIDER}:{model}\n{INDEX_PIPELINE_VERSION}\n{pdf_sha256}"
 
 
 def _format_results(results: list[Document]) -> str:
@@ -481,11 +515,12 @@ def _write_chunks(
     """Add all chunks in batches, reporting optional progress."""
     chunks = [_contextualize_chunk(chunk, doc_name) for chunk in chunks]
     total = len(chunks)
-    for start in range(0, total, EMBED_BATCH_SIZE):
-        _add_documents_with_retries(vectorstore, chunks[start : start + EMBED_BATCH_SIZE])
+    batch_size = _embed_batch_size()
+    for start in range(0, total, batch_size):
+        _add_documents_with_retries(vectorstore, chunks[start : start + batch_size])
         time.sleep(EMBED_BATCH_QUIET_SECONDS)
         if progress:
-            progress(min(start + EMBED_BATCH_SIZE, total), total)
+            progress(min(start + batch_size, total), total)
 
 
 def _prepare_collection(vectorstore: Chroma, collection_name: str) -> Chroma:
@@ -558,7 +593,8 @@ def index_pdf(
                 "name": name or path.name,
                 "source": str(path),
                 "sha256": sha,
-                "embedding_model": JINA_EMBEDDING_MODEL,
+                "embedding_provider": EMBEDDING_PROVIDER,
+                "embedding_model": GOOGLE_EMBEDDING_MODEL if EMBEDDING_PROVIDER == "google" else JINA_EMBEDDING_MODEL,
                 "pages": len(pages),
                 "chunks": total,
                 "indexed_at": datetime.now(timezone.utc).isoformat(),

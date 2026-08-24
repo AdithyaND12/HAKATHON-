@@ -14,6 +14,8 @@ load_dotenv()
 
 DEFAULT_GEMINI_MODEL = "gemini-3.5-flash-lite"
 DEFAULT_JINA_EMBEDDING_MODEL = "jina-embeddings-v4"
+DEFAULT_GEMINI_EMBEDDING_MODEL = "gemini-embedding-001"
+DEFAULT_EMBEDDING_PROVIDER = "jina"
 _RETIRED_GEMINI_MODELS = {
     "gemini-1.5-flash": "gemini-3.5-flash-lite",
     "models/gemini-1.5-flash": "gemini-3.5-flash-lite",
@@ -110,7 +112,13 @@ MAX_AUTO_RUNS = env_int("MAX_AUTO_RUNS", DEFAULT_MAX_AUTO_RUNS)
 DATA_DIR = env_path("HAKATHON_DATA_DIR", DEFAULT_DATA_DIR)
 # Chunks per embedding request to Jina (one HTTP POST per batch). Batches of
 # ~100 keep request counts low on the free tier (1M tokens/day, 100 RPM).
-JINA_EMBEDDING_BATCH_SIZE = env_int("JINA_EMBEDDING_BATCH_SIZE", 100)
+JINA_EMBEDDING_BATCH_SIZE = env_int("JINA_EMBEDDING_BATCH_SIZE", 32)
+
+# Embedding provider: "jina" (default, free tier) or "google" (Gemini embeddings).
+EMBEDDING_PROVIDER = env_str("EMBEDDING_PROVIDER", DEFAULT_EMBEDDING_PROVIDER)
+GOOGLE_EMBEDDING_MODEL = env_str("GOOGLE_EMBEDDING_MODEL", DEFAULT_GEMINI_EMBEDDING_MODEL)
+GOOGLE_EMBEDDING_BATCH_SIZE = env_int("GOOGLE_EMBEDDING_BATCH_SIZE", 100)
+
 DUCKDUCKGO_REGION = env_str("DUCKDUCKGO_REGION", "us-en")
 SEARCH_MAX_RETRIES = env_int("SEARCH_MAX_RETRIES", 3)
 SEARCH_RETRY_BACKOFF_SECONDS = env_float("SEARCH_RETRY_BACKOFF_SECONDS", 2.0)
