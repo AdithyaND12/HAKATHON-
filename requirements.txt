@@ -22,6 +22,10 @@ streamlit-autorefresh
 fastapi
 uvicorn
 python-multipart
+# Google OAuth 2.0 + Gmail API (per-user authentication)
+google-api-python-client
+google-auth-httplib2
+google-auth-oauthlib
 # Waggle memory server is NOT installed here: it's a subprocess launched only
 # when WAGGLE_MCP_ENABLED=true, and its dependency chain (sentence-transformers
 # -> torch, etc.) exceeds Streamlit Cloud's build resources. Install it locally:

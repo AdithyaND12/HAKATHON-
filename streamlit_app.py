@@ -57,6 +57,7 @@ except ImportError:  # pragma: no cover - only hit when the optional dep is miss
 # Reuse everything the CLI used.
 import config
 import ragtool
+import gmail_client
 from app import _registry, chatbot, llm, scheduler, set_chatbot_model
 from waggle_tools import WAGGLE_MEMORY_POLICY, memorize_turn, prime_session
 from planner import (
@@ -958,7 +959,7 @@ def _handle_pdf_upload(uploaded, *, index: bool) -> None:
                 log.exception("PDF indexing failed for %s", target)
                 status.update(label="indexing failed", state="error")
                 st.error(
-                    "Indexing failed — check the Jina API key / quota. Details were logged."
+                    "Indexing failed — check the embedding API key / quota. Details were logged."
                 )
                 return
             ragtool.set_active_collection(ragtool.collection_name_for_sha(sha))
@@ -1073,8 +1074,23 @@ with st.sidebar:
         set_chatbot_model(config.GEMINI_MODEL_OPTIONS[picked_model])
         st.session_state["_active_model_label"] = picked_model
     st.caption(f"active: **{st.session_state['_active_model_label']}**")
+
+    # Embedding provider selector
+    embedding_options = ["jina", "google"]
+    current_provider = ragtool.get_embedding_provider()
+    picked_embedding = st.selectbox(
+        "embedding",
+        options=embedding_options,
+        index=embedding_options.index(current_provider),
+        key="embedding_provider_picker",
+        help="Jina (free tier) or Google Gemini embeddings for RAG.",
+    )
+    if picked_embedding != current_provider:
+        ragtool.set_embedding_provider(picked_embedding)
+        st.rerun()
+
     if st.session_state.get("rag_mode", True):
-        st.caption(f"embedding: `{config.JINA_EMBEDDING_MODEL}`")
+        st.caption(f"embedding model: `{ragtool.get_embedding_model_name()}`")
     else:
         st.caption("embedding: off (raw mode)")
     active = _registry.active()
@@ -1162,6 +1178,55 @@ with st.sidebar:
         ):
             ragtool.remove_raw_document(raw_id)
             st.rerun()
+
+    st.divider()
+
+    # ---- Gmail: per-user OAuth connection -----------------------------------
+    st.markdown("### gmail")
+
+    # Handle OAuth callback: Google redirects with ?code=...&state=...
+    _oauth_code = st.query_params.get("code")
+    _oauth_state = st.query_params.get("state")
+    if _oauth_code and _oauth_state:
+        try:
+            gmail_client.exchange_code(_oauth_code, _oauth_state)
+            st.session_state["gmail_session_id"] = _oauth_state
+            st.toast("Gmail connected!")
+        except Exception as exc:
+            st.error(f"Gmail auth failed: {exc}")
+        st.query_params.clear()
+
+    gmail_session_id = st.session_state.get("gmail_session_id", "")
+    gmail_connected = gmail_client.is_connected(gmail_session_id) if gmail_session_id else False
+
+    if gmail_connected:
+        try:
+            _profile = gmail_client.get_profile(gmail_session_id)
+            _email = _profile.get("emailAddress", "connected")
+        except Exception:
+            _email = "connected"
+        st.caption(f"active: **{_email}**")
+        if st.button("disconnect gmail", use_container_width=True):
+            gmail_client.delete_tokens(gmail_session_id)
+            st.session_state.pop("gmail_session_id", None)
+            st.rerun()
+    else:
+        # Generate a session_id and build the Google consent URL
+        import uuid as _uuid
+        if not gmail_session_id:
+            gmail_session_id = _uuid.uuid4().hex[:12]
+            st.session_state["gmail_session_id"] = gmail_session_id
+        try:
+            _auth_url = gmail_client.get_auth_url(gmail_session_id)
+            st.markdown(
+                f'<a href="{_auth_url}" target="_blank" '
+                f'style="text-decoration:none;color:#7ee787;font-family:monospace;font-size:0.8rem;">'
+                f'connect gmail</a>',
+                unsafe_allow_html=True,
+            )
+            st.caption("opens Google's official consent screen")
+        except RuntimeError as exc:
+            st.warning(str(exc))
 
     st.divider()
     _active_chat_for_export = st.session_state.conversations[st.session_state.active_conv]

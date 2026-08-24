@@ -3,15 +3,18 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import uuid
 from contextlib import asynccontextmanager
 from typing import Any, Dict, List, Optional
 
-from fastapi import FastAPI, File, HTTPException, UploadFile, status
+from fastapi import FastAPI, File, HTTPException, Query, UploadFile, status
+from fastapi.responses import RedirectResponse
 from pydantic import BaseModel, Field
 from langchain_core.messages import HumanMessage, SystemMessage
 
 import config
 import ragtool
+import gmail_client
 from app import _registry, chatbot, scheduler
 from planner import create_search_plan, SearchPlan, SearchExecutionInstruction
 from scheduler import ScheduleValidationError, _extract_content
@@ -238,3 +241,128 @@ async def set_active_document(request: ActiveDocumentRequest):
     """Select or clear the active RAG document collection."""
     ragtool.set_active_collection(request.collection_name)
     return {"message": f"Active collection set to {request.collection_name}"}
+
+
+# ---- Gmail OAuth endpoints ------------------------------------------------
+
+@app.get("/gmail/auth")
+async def gmail_auth(session_id: str = Query(default=None)):
+    """Redirect to Google's OAuth consent screen.
+
+    Generates a unique session_id if none provided, stores it in the
+    redirect URL so the callback can route tokens back.
+    """
+    if not session_id:
+        session_id = uuid.uuid4().hex[:12]
+    try:
+        url = gmail_client.get_auth_url(session_id)
+    except RuntimeError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=str(exc),
+        )
+    return RedirectResponse(url=url)
+
+
+@app.get("/gmail/callback")
+async def gmail_callback(code: str = Query(...), state: str = Query(default="")):
+    """Handle Google OAuth redirect: exchange code for tokens, then redirect
+    back to the Streamlit app with the session_id in the URL.
+    """
+    session_id = state or uuid.uuid4().hex[:12]
+    try:
+        gmail_client.exchange_code(code, session_id)
+    except Exception as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"OAuth token exchange failed: {exc}",
+        )
+    # Redirect back to Streamlit with session_id so it can load tokens
+    streamlit_url = f"/?gmail_session={session_id}"
+    return RedirectResponse(url=streamlit_url)
+
+
+@app.get("/gmail/status")
+async def gmail_status(session_id: str = Query(...)):
+    """Check whether the given session has valid Gmail tokens."""
+    connected = gmail_client.is_connected(session_id)
+    profile = None
+    if connected:
+        try:
+            profile = gmail_client.get_profile(session_id)
+        except Exception:
+            pass
+    return {
+        "connected": connected,
+        "email": profile.get("emailAddress") if profile else None,
+    }
+
+
+@app.post("/gmail/disconnect")
+async def gmail_disconnect(session_id: str = Query(...)):
+    """Delete stored Gmail tokens for the given session."""
+    gmail_client.delete_tokens(session_id)
+    return {"message": "Gmail disconnected"}
+
+
+@app.get("/gmail/messages")
+async def gmail_list_messages(
+    session_id: str = Query(...),
+    query: str = Query(default=""),
+    max_results: int = Query(default=20, ge=1, le=100),
+):
+    """List messages in the user's Gmail inbox."""
+    if not gmail_client.is_connected(session_id):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Gmail not connected. Visit /gmail/auth to connect.",
+        )
+    try:
+        return gmail_client.list_messages(session_id, query=query, max_results=max_results)
+    except Exception as exc:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Gmail API error: {exc}",
+        )
+
+
+@app.get("/gmail/messages/{msg_id}")
+async def gmail_get_message(
+    msg_id: str,
+    session_id: str = Query(...),
+):
+    """Get a single Gmail message by ID."""
+    if not gmail_client.is_connected(session_id):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Gmail not connected.",
+        )
+    try:
+        return gmail_client.get_message(session_id, msg_id)
+    except Exception as exc:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Gmail API error: {exc}",
+        )
+
+
+@app.post("/gmail/send")
+async def gmail_send_message(
+    session_id: str = Query(...),
+    to: str = Query(...),
+    subject: str = Query(...),
+    body: str = Query(...),
+):
+    """Send an email via Gmail."""
+    if not gmail_client.is_connected(session_id):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Gmail not connected.",
+        )
+    try:
+        return gmail_client.send_message(session_id, to=to, subject=subject, body=body)
+    except Exception as exc:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Gmail API error: {exc}",
+        )
