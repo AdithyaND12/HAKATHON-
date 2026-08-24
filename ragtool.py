@@ -63,6 +63,38 @@ HTTP_TIMEOUT_SECONDS = config.HTTP_TIMEOUT_SECONDS
 JINA_EMBED_BATCH_SIZE = config.JINA_EMBEDDING_BATCH_SIZE
 GOOGLE_EMBED_BATCH_SIZE = config.GOOGLE_EMBEDDING_BATCH_SIZE
 
+# Active provider can be changed at runtime via set_embedding_provider().
+_active_provider = EMBEDDING_PROVIDER
+
+
+def get_embedding_provider() -> str:
+    """Return the currently active embedding provider name."""
+    return _active_provider
+
+
+def get_embedding_model_name() -> str:
+    """Return the model name for the currently active embedding provider."""
+    if _active_provider == "google":
+        return GOOGLE_EMBEDDING_MODEL
+    return JINA_EMBEDDING_MODEL
+
+
+def set_embedding_provider(provider: str) -> None:
+    """Switch the embedding provider at runtime ('jina' or 'google').
+
+    Resets the shared Chroma client so the next operation uses a store
+    namespaced to the new provider+model.
+    """
+    global _active_provider, _CLIENT
+    provider = provider.strip().lower()
+    if provider not in ("jina", "google"):
+        raise ValueError(f"Unknown embedding provider: {provider!r} (expected 'jina' or 'google')")
+    if provider == _active_provider:
+        return
+    _active_provider = provider
+    # Reset client so PERSIST_DIRECTORY is re-evaluated for the new provider.
+    _CLIENT = None
+
 
 def _model_slug(model_name: str) -> str:
     """Filesystem-safe name for a model, e.g. ``jina-embeddings-v4``."""
@@ -79,18 +111,23 @@ STORE_ROOT = Path(__file__).resolve().parent / "chroma_stores"
 # (different dimension) are incompatible. Namespacing by provider+model means
 # switching embedding models can never touch another model's store.
 def _active_model_slug() -> str:
-    if EMBEDDING_PROVIDER == "google":
+    if _active_provider == "google":
         return _model_slug(GOOGLE_EMBEDDING_MODEL)
     return _model_slug(JINA_EMBEDDING_MODEL)
 
 PERSIST_DIRECTORY = STORE_ROOT / _active_model_slug()
+
+
+def _persist_dir() -> Path:
+    """Current persist directory, dynamically resolved for the active provider."""
+    return STORE_ROOT / _active_model_slug()
 DEFAULT_QUERY = "the user's document"
 DEFAULT_TOP_K = 4
 
 
 def _embed_batch_size() -> int:
     """Chunks per embedding batch, provider-aware."""
-    if EMBEDDING_PROVIDER == "google":
+    if _active_provider == "google":
         return GOOGLE_EMBED_BATCH_SIZE
     return JINA_EMBED_BATCH_SIZE
 
@@ -225,7 +262,7 @@ def _split_documents(documents: list[Document]) -> list[Document]:
 
 def _get_embedding_model() -> Embeddings:
     """Return the configured embedding model (Jina or Google)."""
-    if EMBEDDING_PROVIDER == "google":
+    if _active_provider == "google":
         if GoogleGenerativeAIEmbeddings is None:
             raise ImportError(
                 "langchain-google-genai is required for Google embeddings. "
@@ -243,6 +280,7 @@ def _get_embedding_model() -> Embeddings:
 
 
 _CLIENT: Optional[PersistentClient] = None
+_CLIENT_PROVIDER: Optional[str] = None  # tracks which provider the client was created for
 
 
 def _get_client() -> PersistentClient:
@@ -252,14 +290,19 @@ def _get_client() -> PersistentClient:
     Creating a NEW client per call means a querying client may never see the
     other client's still-pending writes, causing spurious "collection not
     initialized" failures. A single shared client keeps index + query coherent.
+
+    The client is reset when the embedding provider changes so the store
+    directory is re-evaluated for the new provider+model namespace.
     """
-    global _CLIENT
-    if _CLIENT is None:
-        PERSIST_DIRECTORY.mkdir(parents=True, exist_ok=True)
+    global _CLIENT, _CLIENT_PROVIDER
+    current_dir = STORE_ROOT / _active_model_slug()
+    if _CLIENT is None or _CLIENT_PROVIDER != _active_provider:
+        current_dir.mkdir(parents=True, exist_ok=True)
         # allow_reset lets the corruption self-heal wipe the store in-process.
         _CLIENT = PersistentClient(
-            path=str(PERSIST_DIRECTORY), settings=Settings(allow_reset=True)
+            path=str(current_dir), settings=Settings(allow_reset=True)
         )
+        _CLIENT_PROVIDER = _active_provider
     return _CLIENT
 
 
@@ -345,7 +388,8 @@ def _rebuild_store() -> None:
     sqlite handle is open — deleting the folder underneath a live client
     produces a readonly-database error instead of a reset.
     """
-    log.warning("Resetting Chroma store %s and rebuilding from scratch.", PERSIST_DIRECTORY)
+    persist_dir = STORE_ROOT / _active_model_slug()
+    log.warning("Resetting Chroma store %s and rebuilding from scratch.", persist_dir)
     _get_client().reset()
 
 
@@ -388,8 +432,8 @@ def _expected_marker(pdf_sha256: str) -> str:
     pipeline version additionally invalidates collections whose vectors were
     produced by an older chunking/contextualization logic.
     """
-    model = GOOGLE_EMBEDDING_MODEL if EMBEDDING_PROVIDER == "google" else JINA_EMBEDDING_MODEL
-    return f"{EMBEDDING_PROVIDER}:{model}\n{INDEX_PIPELINE_VERSION}\n{pdf_sha256}"
+    model = GOOGLE_EMBEDDING_MODEL if _active_provider == "google" else JINA_EMBEDDING_MODEL
+    return f"{_active_provider}:{model}\n{INDEX_PIPELINE_VERSION}\n{pdf_sha256}"
 
 
 def _format_results(results: list[Document]) -> str:
@@ -461,11 +505,11 @@ def collection_name_for_sha(pdf_sha256: str) -> str:
 
 
 def _collection_marker_path(collection_name: str) -> Path:
-    return PERSIST_DIRECTORY / f".marker_{collection_name}"
+    return _persist_dir() / f".marker_{collection_name}"
 
 
 def _collection_meta_path(collection_name: str) -> Path:
-    return PERSIST_DIRECTORY / f".meta_{collection_name}.json"
+    return _persist_dir() / f".meta_{collection_name}.json"
 
 
 def _collection_is_current(
@@ -581,7 +625,7 @@ def index_pdf(
             doc_name=name or path.name,
         )
 
-    PERSIST_DIRECTORY.mkdir(parents=True, exist_ok=True)
+    _persist_dir().mkdir(parents=True, exist_ok=True)
     _collection_marker_path(collection_name).write_text(
         _expected_marker(sha), encoding="utf-8"
     )
@@ -593,8 +637,8 @@ def index_pdf(
                 "name": name or path.name,
                 "source": str(path),
                 "sha256": sha,
-                "embedding_provider": EMBEDDING_PROVIDER,
-                "embedding_model": GOOGLE_EMBEDDING_MODEL if EMBEDDING_PROVIDER == "google" else JINA_EMBEDDING_MODEL,
+                "embedding_provider": _active_provider,
+                "embedding_model": GOOGLE_EMBEDDING_MODEL if _active_provider == "google" else JINA_EMBEDDING_MODEL,
                 "pages": len(pages),
                 "chunks": total,
                 "indexed_at": datetime.now(timezone.utc).isoformat(),
@@ -607,7 +651,7 @@ def index_pdf(
 
 
 def _active_collection_path() -> Path:
-    return PERSIST_DIRECTORY / ".active_collection"
+    return _persist_dir() / ".active_collection"
 
 
 def set_active_collection(collection_name: Optional[str]) -> None:
@@ -619,7 +663,7 @@ def set_active_collection(collection_name: Optional[str]) -> None:
     global _ACTIVE_COLLECTION
     _ACTIVE_COLLECTION = collection_name or None
     try:
-        PERSIST_DIRECTORY.mkdir(parents=True, exist_ok=True)
+        _persist_dir().mkdir(parents=True, exist_ok=True)
         path = _active_collection_path()
         if _ACTIVE_COLLECTION:
             path.write_text(_ACTIVE_COLLECTION, encoding="utf-8")
@@ -671,7 +715,7 @@ def active_source_label() -> Optional[str]:
 def list_indexed_documents() -> list[dict]:
     """Return metadata records for every uploaded indexed PDF."""
     docs: list[dict] = []
-    for meta_file in PERSIST_DIRECTORY.glob(f".meta_{DOC_PREFIX}*.json"):
+    for meta_file in _persist_dir().glob(f".meta_{DOC_PREFIX}*.json"):
         try:
             docs.append(json.loads(meta_file.read_text(encoding="utf-8")))
         except ValueError:
@@ -745,11 +789,11 @@ def raw_id_for_sha(pdf_sha256: str) -> str:
 
 
 def _raw_meta_path(raw_id: str) -> Path:
-    return PERSIST_DIRECTORY / f".meta_{raw_id}.json"
+    return _persist_dir() / f".meta_{raw_id}.json"
 
 
 def _raw_active_path() -> Path:
-    return PERSIST_DIRECTORY / ".active_raw_document"
+    return _persist_dir() / ".active_raw_document"
 
 
 def set_active_raw(raw_id: Optional[str]) -> None:
@@ -761,7 +805,7 @@ def set_active_raw(raw_id: Optional[str]) -> None:
     global _ACTIVE_RAW
     _ACTIVE_RAW = raw_id or None
     try:
-        PERSIST_DIRECTORY.mkdir(parents=True, exist_ok=True)
+        _persist_dir().mkdir(parents=True, exist_ok=True)
         path = _raw_active_path()
         if _ACTIVE_RAW:
             path.write_text(_ACTIVE_RAW, encoding="utf-8")
@@ -830,7 +874,7 @@ def store_raw_pdf(
         "raw": True,
         "indexed_at": datetime.now(timezone.utc).isoformat(),
     }
-    PERSIST_DIRECTORY.mkdir(parents=True, exist_ok=True)
+    _persist_dir().mkdir(parents=True, exist_ok=True)
     _raw_meta_path(raw_id).write_text(json.dumps(meta, indent=2), encoding="utf-8")
     set_active_raw(raw_id)
     return meta

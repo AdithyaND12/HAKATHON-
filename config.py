@@ -142,6 +142,23 @@ else:
 # with orphaned servers). Override only when you know no other instance runs.
 GMAIL_MCP_PORT = env_str("GMAIL_MCP_PORT", "0")
 
+# Per-user Gmail OAuth 2.0 (direct Google API, not gmail-mcp).
+# Each visitor authenticates with their own Google account.
+GOOGLE_OAUTH_CLIENT_ID = env_str("GOOGLE_OAUTH_CLIENT_ID")
+GOOGLE_OAUTH_CLIENT_SECRET = env_str("GOOGLE_OAUTH_CLIENT_SECRET")
+GOOGLE_OAUTH_REDIRECT_URI = env_str(
+    "GOOGLE_OAUTH_REDIRECT_URI",
+    "http://localhost:8501",
+)
+GOOGLE_OAUTH_SCOPES = [
+    "https://www.googleapis.com/auth/gmail.readonly",
+    "https://www.googleapis.com/auth/gmail.send",
+    "https://www.googleapis.com/auth/gmail.compose",
+    "https://www.googleapis.com/auth/gmail.modify",
+]
+# Directory for per-user token files (.hakathon/gmail_tokens/{session_id}.json)
+GMAIL_TOKENS_DIR = DATA_DIR / "gmail_tokens"
+
 # Waggle MCP memory integration: persistent graph memory (decisions,
 # preferences, project facts) shared across conversations and sessions.
 # Disabled by default so the test suite never spawns a subprocess; set
