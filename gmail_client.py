@@ -22,9 +22,10 @@ import json
 import logging
 from pathlib import Path
 from typing import Optional
+from urllib.parse import urlencode
 
+import requests
 from google.oauth2.credentials import Credentials
-from google_auth_oauthlib.flow import Flow
 from googleapiclient.discovery import build
 
 import config
@@ -53,8 +54,8 @@ def _token_path(session_id: str) -> Path:
 def get_auth_url(session_id: str) -> str:
     """Build the Google OAuth consent-screen URL for `session_id`.
 
-    The session_id is encoded as the OAuth `state` parameter so the callback
-    can route tokens back to the correct Streamlit session.
+    Uses plain requests (no PKCE) so the code verifier isn't lost across
+    the redirect. The session_id is passed as the OAuth `state` parameter.
     """
     if not config.GOOGLE_OAUTH_CLIENT_ID or not config.GOOGLE_OAUTH_CLIENT_SECRET:
         raise RuntimeError(
@@ -62,55 +63,48 @@ def get_auth_url(session_id: str) -> str:
             "GOOGLE_OAUTH_CLIENT_SECRET in your .env file."
         )
 
-    flow = Flow.from_client_config(
-        {
-            "web": {
-                "client_id": config.GOOGLE_OAUTH_CLIENT_ID,
-                "client_secret": config.GOOGLE_OAUTH_CLIENT_SECRET,
-                "auth_uri": "https://accounts.google.com/o/oauth2/auth",
-                "token_uri": "https://oauth2.googleapis.com/token",
-                "redirect_uris": [config.GOOGLE_OAUTH_REDIRECT_URI],
-            }
-        },
-        scopes=_SCOPES,
-    )
-    flow.redirect_uri = config.GOOGLE_OAUTH_REDIRECT_URI
-
-    url, _ = flow.authorization_url(
-        access_type="offline",
-        prompt="consent",
-        state=session_id,
-        include_granted_scopes="true",
-    )
-    return url
+    params = {
+        "client_id": config.GOOGLE_OAUTH_CLIENT_ID,
+        "redirect_uri": config.GOOGLE_OAUTH_REDIRECT_URI,
+        "response_type": "code",
+        "scope": " ".join(_SCOPES),
+        "state": session_id,
+        "access_type": "offline",
+        "prompt": "consent",
+        "include_granted_scopes": "true",
+    }
+    return f"https://accounts.google.com/o/oauth2/auth?{urlencode(params)}"
 
 
 def exchange_code(code: str, session_id: str) -> dict:
-    """Exchange an authorization code for tokens; persist and return them."""
-    flow = Flow.from_client_config(
-        {
-            "web": {
-                "client_id": config.GOOGLE_OAUTH_CLIENT_ID,
-                "client_secret": config.GOOGLE_OAUTH_CLIENT_SECRET,
-                "auth_uri": "https://accounts.google.com/o/oauth2/auth",
-                "token_uri": "https://oauth2.googleapis.com/token",
-                "redirect_uris": [config.GOOGLE_OAUTH_REDIRECT_URI],
-            }
-        },
-        scopes=_SCOPES,
-    )
-    flow.redirect_uri = config.GOOGLE_OAUTH_REDIRECT_URI
-    flow.fetch_token(code=code)
+    """Exchange an authorization code for tokens; persist and return them.
 
-    creds = flow.credentials
+    Uses a plain POST to Google's token endpoint — no PKCE code_verifier
+    needed.
+    """
+    resp = requests.post(
+        "https://oauth2.googleapis.com/token",
+        data={
+            "code": code,
+            "client_id": config.GOOGLE_OAUTH_CLIENT_ID,
+            "client_secret": config.GOOGLE_OAUTH_CLIENT_SECRET,
+            "redirect_uri": config.GOOGLE_OAUTH_REDIRECT_URI,
+            "grant_type": "authorization_code",
+        },
+        timeout=30,
+    )
+    if resp.status_code != 200:
+        raise RuntimeError(f"Token exchange failed: {resp.text}")
+
+    data = resp.json()
     token_data = {
-        "token": creds.token,
-        "refresh_token": creds.refresh_token,
-        "token_uri": creds.token_uri,
-        "client_id": creds.client_id,
-        "client_secret": creds.client_secret,
-        "scopes": list(creds.scopes or []),
-        "expiry": creds.expiry.isoformat() if creds.expiry else None,
+        "token": data.get("access_token"),
+        "refresh_token": data.get("refresh_token"),
+        "token_uri": "https://oauth2.googleapis.com/token",
+        "client_id": config.GOOGLE_OAUTH_CLIENT_ID,
+        "client_secret": config.GOOGLE_OAUTH_CLIENT_SECRET,
+        "scopes": data.get("scope", "").split(),
+        "expiry": None,
     }
     _save_tokens(session_id, token_data)
     log.info("Gmail OAuth tokens saved for session %s", session_id)
