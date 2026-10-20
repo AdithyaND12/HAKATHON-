@@ -162,6 +162,11 @@ _COUNT_RE = re.compile(
     rf"\b(?P<count>{_NUMBER_TOKEN})\s*(?:times?|runs?|checks?|iterations?)\b",
     re.IGNORECASE,
 )
+_EVERY_INTERVAL_RE = re.compile(
+    rf"\b(?:every|each)\s+(?P<value>{_NUMBER_TOKEN})\s*"
+    r"(?P<unit>seconds?|secs?|minutes?|mins?|hours?|hrs?|days?)\b",
+    re.IGNORECASE,
+)
 _HOURLY_RE = re.compile(r"\b(?:hourly|every\s+hour)\b", re.IGNORECASE)
 _DAILY_RE = re.compile(r"\b(?:daily|every\s+day)\b", re.IGNORECASE)
 _ABSOLUTE_TIME_RE = re.compile(
@@ -212,6 +217,35 @@ def _unit_to_minutes(value: float, unit: str) -> float:
     if unit.startswith("day"):
         return value * 60 * 24
     return value  # minutes
+
+
+def _explicit_schedule_hints(
+    prompt: str,
+) -> tuple[Optional[float], Optional[int], bool]:
+    """Extract literal recurrence/count values from the prompt.
+
+    The LLM planner occasionally returns seconds where minutes are expected
+    (e.g. ``1 min`` -> ``0.0167``). Literal values in the user's prompt are
+    authoritative, so they override the model's conversion.
+    """
+    interval: Optional[float] = None
+    match = _EVERY_INTERVAL_RE.search(prompt)
+    if match:
+        interval = _unit_to_minutes(
+            _parse_number_token(match.group("value")), match.group("unit")
+        )
+    elif _HOURLY_RE.search(prompt):
+        interval = 60.0
+    elif _DAILY_RE.search(prompt):
+        interval = 24 * 60.0
+
+    count_match = _COUNT_RE.search(prompt)
+    count = (
+        int(_parse_number_token(count_match.group("count")))
+        if count_match
+        else None
+    )
+    return interval, count, interval is not None
 
 
 def _local_wall_time_to_utc(naive: datetime) -> datetime:
@@ -657,6 +691,24 @@ def create_search_plan(prompt: str) -> SearchPlan:
     except Exception as exc:  # noqa: BLE001
         log.warning("Search planning unavailable (%s); using local fallback.", exc)
         plan = _fallback_search_plan(prompt)
+
+    # Literal schedule values in the prompt win over the LLM's conversion. In
+    # particular, models sometimes return seconds for "every 1 min" (0.0167),
+    # which fires every run before the UI can poll and looks like one burst.
+    (
+        explicit_interval,
+        explicit_count,
+        explicit_recurrence,
+    ) = _explicit_schedule_hints(prompt)
+    if explicit_interval is not None:
+        plan = plan.model_copy(
+            update={"wait_minutes": explicit_interval, "should_schedule": True}
+        )
+    if explicit_count is not None:
+        update = {"run_count": explicit_count}
+        if explicit_recurrence and explicit_count > 1:
+            update["should_schedule"] = True
+        plan = plan.model_copy(update=update)
 
     # If the LLM didn't pick a clearly-non-search task_type, run regex intent
     # detection as a safety net (esp. for reminders, which local models often miss).

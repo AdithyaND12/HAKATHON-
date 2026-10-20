@@ -213,3 +213,38 @@ def test_absolute_start_is_normalized_to_utc():
     naive = planner._normalize_absolute_start("2030-01-01T09:00:00")
     assert naive is not None and naive.endswith("+00:00")
     assert planner._normalize_absolute_start("tomorrow at 9") is None
+
+
+def test_literal_interval_and_count_override_llm_conversion(monkeypatch):
+    """The LLM sometimes converts "every 1 min" to 0.0167 (seconds). Literal
+    prompt values must win so the second run does not fire immediately."""
+    bad_plan = planner.SearchPlan(
+        search_query="car",
+        should_schedule=True,
+        wait_minutes=1 / 60,
+        run_count=1,
+    )
+    monkeypatch.setattr(planner, "_invoke_search_planner", lambda messages: bad_plan)
+
+    plan = planner.create_search_plan(
+        "can you search about car in internet for 2 times every 1 min"
+    )
+
+    assert plan.wait_minutes == 1.0
+    assert plan.run_count == 2
+    assert plan.should_schedule is True
+
+
+def test_literal_hourly_interval_overrides_llm(monkeypatch):
+    bad_plan = planner.SearchPlan(
+        search_query="news",
+        should_schedule=True,
+        wait_minutes=0.0167,
+        run_count=1,
+    )
+    monkeypatch.setattr(planner, "_invoke_search_planner", lambda messages: bad_plan)
+
+    plan = planner.create_search_plan("check news every hour twice")
+
+    assert plan.wait_minutes == 60.0
+    assert plan.should_schedule is True
