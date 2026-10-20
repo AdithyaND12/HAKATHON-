@@ -257,3 +257,38 @@ def test_document_endpoints_list_and_set_active(monkeypatch):
     assert list_response.json() == [{"name": "doc.pdf"}]
     assert active_response.status_code == 200
     assert active["name"] == "rag_123"
+
+
+# ---- Regression tests for input validation -----------------------------------
+
+
+def test_gmail_endpoints_reject_path_traversal_session_ids():
+    response = client.get("/gmail/status", params={"session_id": "../conversations"})
+    assert response.status_code == 400
+
+    response = client.post("/gmail/disconnect", params={"session_id": "../conversations"})
+    assert response.status_code == 400
+
+
+def test_gmail_callback_rejects_unissued_state():
+    response = client.get("/gmail/callback", params={"code": "x", "state": "../conversations"})
+    assert response.status_code == 400
+    assert "OAuth state" in response.json()["detail"]
+
+
+def test_upload_rejects_non_pdf_extension():
+    response = client.post(
+        "/documents/upload",
+        files={"file": ("notes.txt", b"hello", "text/plain")},
+    )
+    assert response.status_code == 400
+    assert "Only PDF" in response.json()["detail"]
+
+
+def test_upload_rejects_non_pdf_content():
+    response = client.post(
+        "/documents/upload",
+        files={"file": ("fake.pdf", b"not really a pdf", "application/pdf")},
+    )
+    assert response.status_code == 400
+    assert "does not look like a PDF" in response.json()["detail"]

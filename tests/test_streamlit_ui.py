@@ -34,6 +34,7 @@ def _stub_streamlit_and_load(tmp_path, monkeypatch):
 
     st = types.ModuleType("streamlit")
     st.session_state = _AttrDict()
+    st.query_params = _AttrDict()
     st.set_page_config = lambda **kwargs: None
     st.markdown = lambda *a, **k: None
     st.caption = lambda *a, **k: None
@@ -416,3 +417,55 @@ def test_render_live_runs_in_appends_cards_to_container(tmp_path, monkeypatch):
     app_mod._render_live_runs_in([run], lambda html, unsafe_allow_html: rendered.append(html))
     assert rendered == []
     assert st.session_state["conversations"]["other"]["messages"][-1]["kind"] == "scheduled_run"
+
+
+# ---- Regression tests for XSS and streamed-run safety ------------------------
+
+
+def test_plan_summary_escapes_user_html(tmp_path, monkeypatch):
+    app_mod, _ = _stub_streamlit_and_load(tmp_path, monkeypatch)
+    from planner import SearchPlan
+
+    plan = SearchPlan(
+        search_query='<img src=x onerror="alert(1)">',
+        should_schedule=True,
+        wait_minutes=5,
+        run_count=2,
+    )
+
+    out = app_mod._plan_summary_html(plan)
+
+    assert "<img" not in out
+    assert "&lt;img" in out
+
+
+def test_stream_failure_after_partial_output_does_not_reinvoke(tmp_path, monkeypatch):
+    app_mod, _ = _stub_streamlit_and_load(tmp_path, monkeypatch)
+    from planner import SearchPlan
+
+    class FakeChunk:
+        def __init__(self, content="", usage=None):
+            self.content = content
+            self.usage_metadata = usage
+
+    class PartialBot:
+        def __init__(self):
+            self.invoked = False
+
+        def stream(self, inputs, stream_mode="messages"):
+            yield FakeChunk("partial answer"), {}
+            raise RuntimeError("connection dropped")
+
+        def invoke(self, inputs):
+            self.invoked = True
+            raise AssertionError("must not re-run the graph after partial output")
+
+    bot = PartialBot()
+    app_mod.chatbot = bot
+    plan = SearchPlan(search_query="q", should_schedule=False, wait_minutes=0.0, run_count=1)
+
+    out = list(app_mod._stream_chatbot("hi", plan, []))
+
+    assert bot.invoked is False
+    assert out[0] == ("partial answer", None)
+    assert "interrupted" in out[-1][0]

@@ -86,12 +86,13 @@ def test_persist_corruption_error_detection():
     )
 
 
-def test_retrieve_self_heals_corrupt_store(monkeypatch, tmp_path):
-    """A store that raises 'not initialized' on first use must be wiped and
-    rebuilt instead of surfacing the error to the caller."""
+def test_retrieve_self_heals_corrupt_collection(monkeypatch, tmp_path):
+    """A collection that raises 'not initialized' on first use must be
+    re-indexed instead of surfacing the error to the caller."""
     from langchain_core.documents import Document
 
     calls = {"n": 0}
+    reindexed = {"n": 0}
     results = [Document(page_content="recovered chunk", metadata={"page": 2})]
 
     def fake_retrieve_once(query, collection_name, k):
@@ -102,13 +103,18 @@ def test_retrieve_self_heals_corrupt_store(monkeypatch, tmp_path):
             )
         return ragtool._format_results(results)
 
+    def fake_reindex(collection_name):
+        reindexed["n"] += 1
+        return True
+
     monkeypatch.setattr(ragtool, "_retrieve_once", fake_retrieve_once)
     monkeypatch.setattr(ragtool, "PERSIST_DIRECTORY", tmp_path)
-    monkeypatch.setattr(ragtool, "_rebuild_store", lambda: None)
+    monkeypatch.setattr(ragtool, "_reindex_collection", fake_reindex)
 
     out = ragtool._retrieve_with_rebuild("speech", ragtool.collection_name_for_sha("d" * 64), 4)
 
     assert calls["n"] == 2
+    assert reindexed["n"] == 1
     assert "recovered chunk" in out
 
 
@@ -405,9 +411,10 @@ def test_retrieve_once_uses_mmr_for_diversity(monkeypatch):
 
 def test_marker_includes_pipeline_version(monkeypatch):
     monkeypatch.setattr(ragtool, "JINA_EMBEDDING_MODEL", "jina-embeddings-v4")
+    monkeypatch.setattr(ragtool, "_active_provider", "jina")
     assert ragtool.INDEX_PIPELINE_VERSION >= 2
     assert ragtool._expected_marker("a" * 64) == (
-        f"jina-embeddings-v4\n{ragtool.INDEX_PIPELINE_VERSION}\n{'a' * 64}"
+        f"jina:jina-embeddings-v4\n{ragtool.INDEX_PIPELINE_VERSION}\n{'a' * 64}"
     )
 
 
@@ -445,3 +452,55 @@ def test_add_documents_fails_fast_on_daily_quota(monkeypatch):
             _Store(), [Document(page_content="x", metadata={"page": 0})]
         )
     assert attempts["n"] == 1
+
+
+# ---- Regression tests for active-document state -------------------------------
+
+
+def test_retrieve_active_chunks_loads_persisted_selection(monkeypatch, tmp_path):
+    from langchain_core.documents import Document
+
+    monkeypatch.setattr(ragtool, "PERSIST_DIRECTORY", tmp_path)
+    monkeypatch.setattr(ragtool, "_ACTIVE_COLLECTION", None)
+    monkeypatch.setattr(ragtool, "_ACTIVE_RAW", None)
+    collection = ragtool.collection_name_for_sha("c" * 64)
+    (tmp_path / f".meta_{collection}.json").write_text(
+        json.dumps({"collection": collection, "name": "doc.pdf"}), encoding="utf-8"
+    )
+    (tmp_path / ".active_collection").write_text(collection, encoding="utf-8")
+
+    seen = []
+
+    class _Store:
+        def __init__(self, name):
+            seen.append(name)
+
+        def max_marginal_relevance_search(self, query, k=4, fetch_k=20):
+            return [Document(page_content="persisted clause", metadata={"page": 1})]
+
+    monkeypatch.setattr(ragtool, "_get_vectorstore", _Store)
+
+    out = ragtool.retrieve_active_chunks("clause")
+
+    assert seen == [collection]
+    assert "persisted clause" in out
+
+
+def test_selecting_indexed_document_clears_raw(monkeypatch, tmp_path):
+    monkeypatch.setattr(ragtool, "PERSIST_DIRECTORY", tmp_path)
+    monkeypatch.setattr(ragtool, "_ACTIVE_COLLECTION", None)
+    monkeypatch.setattr(ragtool, "_ACTIVE_RAW", "raw_stale")
+
+    ragtool.set_active_collection("rag_fresh")
+
+    assert ragtool.active_raw() is None
+
+
+def test_selecting_raw_document_clears_indexed(monkeypatch, tmp_path):
+    monkeypatch.setattr(ragtool, "PERSIST_DIRECTORY", tmp_path)
+    monkeypatch.setattr(ragtool, "_ACTIVE_COLLECTION", "rag_stale")
+    monkeypatch.setattr(ragtool, "_ACTIVE_RAW", None)
+
+    ragtool.set_active_raw("raw_fresh")
+
+    assert ragtool._ACTIVE_COLLECTION is None

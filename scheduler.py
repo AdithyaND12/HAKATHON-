@@ -27,7 +27,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterable, Optional
 
-import config
+from planner import is_transient_api_error
 
 log = logging.getLogger(__name__)
 
@@ -248,7 +248,15 @@ class JobRegistry:
         except (OSError, ValueError):
             log.warning("Could not read jobs file at %s", self.jobs_file)
             return []
-        return [ScheduledSearchJob.from_dict(item) for item in payload if isinstance(item, dict)]
+        with self._lock:
+            known_ids = set(self._jobs)
+        return [
+            job
+            for item in payload
+            if isinstance(item, dict)
+            for job in [ScheduledSearchJob.from_dict(item)]
+            if job.id not in known_ids
+        ]
 
     # ---- Job lifecycle -------------------------------------------------------
 
@@ -366,21 +374,29 @@ class Scheduler:
         """
         restored: list[ScheduledSearchJob] = []
         for saved in self.registry.load_persisted():
+            # Another session/process may already have launched this job.
+            # Re-registering it would run two workers for the same ID.
+            if self.registry.get(saved.id) is not None:
+                continue
             if saved.status in ("completed", "cancelled", "failed"):
                 # Keep the record but do not re-launch.
                 self.registry.register(saved)
                 continue
-            saved.status = "pending"
+            was_paused = saved.status == "paused"
+            saved.status = "paused" if was_paused else "pending"
             saved.stop_event = threading.Event()
             saved.pause_event = threading.Event()
+            if was_paused:
+                saved.pause_event.set()
             saved.done_event = threading.Event()
-            if saved.next_run_at and not saved.absolute_start_iso:
+            if saved.next_run_at:
                 try:
                     next_run = datetime.fromisoformat(saved.next_run_at)
                 except ValueError:
                     next_run = None
                 if next_run is not None and next_run > datetime.now(timezone.utc):
-                    # Re-arm the worker to fire at the remaining instant.
+                    # Re-arm to the remaining interval. This also replaces a
+                    # stale first-run timestamp from a previous process.
                     saved.absolute_start_iso = saved.next_run_at
             self.registry.register(saved)
             self._launch(saved)
@@ -413,7 +429,7 @@ class Scheduler:
         if wait_seconds <= 0:
             return True
         job.next_run_at = target.isoformat()
-        job.status = "pending"
+        job.status = "paused" if job.pause_event.is_set() else "pending"
         self.registry.update(job)
         console_print(
             f"[{job.id}] Waiting until {target.isoformat()} for the first run..."
@@ -429,7 +445,11 @@ class Scheduler:
                 return self.invoker(state)
             except Exception as exc:  # noqa: BLE001
                 last_error = exc
-                if attempt == self.max_invoke_retries:
+                retryable = (
+                    exc.__class__.__name__ != "GraphRecursionError"
+                    and is_transient_api_error(exc)
+                )
+                if attempt == self.max_invoke_retries or not retryable:
                     break
                 sleep_for = self.invoke_retry_backoff * (2 ** (attempt - 1))
                 console_print(
@@ -506,7 +526,7 @@ class Scheduler:
                 self.registry.update(job)
                 return
 
-            job.status = "running"
+            job.status = "paused" if job.pause_event.is_set() else "running"
             self.registry.update(job)
 
             for run_number in range(job.completed_runs + 1, runs + 1):
@@ -554,6 +574,12 @@ class Scheduler:
                 job.results.append(result)
                 job.completed_runs = run_number
                 job.last_run_at = datetime.now(timezone.utc).isoformat()
+
+                # The absolute start only arms the first run. Clearing it
+                # prevents a resumed job from firing early on the next run.
+                if job.absolute_start_iso is not None:
+                    job.absolute_start_iso = None
+                    self.registry.update(job)
 
                 # Persist run output.
                 content = _extract_content(result)

@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import contextlib
 import hashlib
+import html
 import json
 import logging
 import os
@@ -837,7 +838,13 @@ def _stream_chatbot(prompt: str, plan: SearchPlan, history: list[dict]):
             log.warning("Streaming produced no chunks for %r; using invoke()", prompt)
             yield _run_chatbot(prompt, plan, history), None
     except Exception:  # noqa: BLE001 - degraded, not fatal
-        log.exception("Streaming failed for prompt %r; falling back to invoke()", prompt)
+        log.exception("Streaming failed for prompt %r", prompt)
+        if saw_chunk:
+            # The graph may already have run tools (e.g. sent an email).
+            # Re-invoking it could repeat those side effects, and the user
+            # already saw part of the answer.
+            yield "\n\n[response interrupted]", None
+            return
         yield _run_chatbot(prompt, plan, history), None
 
 
@@ -918,13 +925,17 @@ def _fetch_new_scheduled_runs() -> list[dict]:
 
 
 def _plan_summary_html(plan: SearchPlan) -> str:
+    # This string is rendered with unsafe_allow_html=True, so every value that
+    # can contain user text must be escaped.
+    query = html.escape(repr(plan.search_query))
     parts = [
-        f'<span class="kw">query</span> <span class="val">{plan.search_query!r}</span>',
+        f'<span class="kw">query</span> <span class="val">{query}</span>',
         f'<span class="kw">wait</span> <span class="val">{plan.wait_minutes:g}m</span>',
         f'<span class="kw">runs</span> <span class="val">{plan.run_count}</span>',
     ]
     if plan.absolute_start_iso:
-        parts.append(f'<span class="kw">start</span> <span class="val">{plan.absolute_start_iso}</span>')
+        start = html.escape(str(plan.absolute_start_iso))
+        parts.append(f'<span class="kw">start</span> <span class="val">{start}</span>')
     return " · ".join(parts)
 
 
@@ -1085,7 +1096,7 @@ with st.sidebar:
         key="embedding_provider_picker",
         help="Jina (free tier) or Google Gemini embeddings for RAG.",
     )
-    if picked_embedding != current_provider:
+    if picked_embedding and picked_embedding != current_provider:
         ragtool.set_embedding_provider(picked_embedding)
         st.rerun()
 
@@ -1188,12 +1199,19 @@ with st.sidebar:
     _oauth_code = st.query_params.get("code")
     _oauth_state = st.query_params.get("state")
     if _oauth_code and _oauth_state:
-        try:
-            gmail_client.exchange_code(_oauth_code, _oauth_state)
-            st.session_state["gmail_session_id"] = _oauth_state
-            st.toast("Gmail connected!")
-        except Exception as exc:
-            st.error(f"Gmail auth failed: {exc}")
+        expected_state = st.session_state.get("gmail_session_id")
+        if (
+            _oauth_state != expected_state
+            or not gmail_client.consume_oauth_state(_oauth_state)
+        ):
+            st.error("Gmail auth failed: invalid or expired OAuth state.")
+        else:
+            try:
+                gmail_client.exchange_code(_oauth_code, _oauth_state)
+                st.session_state["gmail_session_id"] = _oauth_state
+                st.toast("Gmail connected!")
+            except Exception as exc:
+                st.error(f"Gmail auth failed: {exc}")
         st.query_params.clear()
 
     gmail_session_id = st.session_state.get("gmail_session_id", "")

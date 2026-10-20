@@ -85,14 +85,26 @@ def set_embedding_provider(provider: str) -> None:
     Resets the shared Chroma client so the next operation uses a store
     namespaced to the new provider+model.
     """
-    global _active_provider, _CLIENT
+    global _active_provider, _CLIENT, PERSIST_DIRECTORY, _ACTIVE_COLLECTION
+    if not isinstance(provider, str) or not provider.strip():
+        raise ValueError(
+            "Embedding provider must be 'jina' or 'google'."
+        )
     provider = provider.strip().lower()
     if provider not in ("jina", "google"):
         raise ValueError(f"Unknown embedding provider: {provider!r} (expected 'jina' or 'google')")
     if provider == _active_provider:
         return
     _active_provider = provider
-    # Reset client so PERSIST_DIRECTORY is re-evaluated for the new provider.
+    # Active IDs are namespaced to the old store; do not leak them into the
+    # new provider, where they would silently resolve to an empty collection.
+    _ACTIVE_COLLECTION = None
+    global _ACTIVE_RAW
+    _ACTIVE_RAW = None
+    # Keep the module-level directory in sync: it is the single source of
+    # truth used by every marker/meta path and can be overridden by callers.
+    PERSIST_DIRECTORY = STORE_ROOT / _active_model_slug()
+    # Reset client so it is re-created inside the new provider's store.
     _CLIENT = None
 
 
@@ -119,8 +131,8 @@ PERSIST_DIRECTORY = STORE_ROOT / _active_model_slug()
 
 
 def _persist_dir() -> Path:
-    """Current persist directory, dynamically resolved for the active provider."""
-    return STORE_ROOT / _active_model_slug()
+    """Current persist directory, overridable for tests and deployments."""
+    return PERSIST_DIRECTORY
 DEFAULT_QUERY = "the user's document"
 DEFAULT_TOP_K = 4
 
@@ -295,7 +307,7 @@ def _get_client() -> PersistentClient:
     directory is re-evaluated for the new provider+model namespace.
     """
     global _CLIENT, _CLIENT_PROVIDER
-    current_dir = STORE_ROOT / _active_model_slug()
+    current_dir = _persist_dir()
     if _CLIENT is None or _CLIENT_PROVIDER != _active_provider:
         current_dir.mkdir(parents=True, exist_ok=True)
         # allow_reset lets the corruption self-heal wipe the store in-process.
@@ -388,7 +400,7 @@ def _rebuild_store() -> None:
     sqlite handle is open — deleting the folder underneath a live client
     produces a readonly-database error instead of a reset.
     """
-    persist_dir = STORE_ROOT / _active_model_slug()
+    persist_dir = _persist_dir()
     log.warning("Resetting Chroma store %s and rebuilding from scratch.", persist_dir)
     _get_client().reset()
 
@@ -475,19 +487,44 @@ def _retrieve_once(query: str, collection_name: str, k: int) -> str:
     return _format_results(results)
 
 
+def _reindex_collection(collection_name: str) -> bool:
+    """Rebuild just one corrupt collection from its stored source PDF.
+
+    A full `client.reset()` here would silently delete every other indexed
+    document, so recovery is scoped to the collection that failed.
+    """
+    meta_path = _collection_meta_path(collection_name)
+    if not meta_path.is_file():
+        return False
+    try:
+        meta = json.loads(meta_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False
+    source = Path(str(meta.get("source", "")))
+    if not source.is_file():
+        return False
+    try:
+        index_pdf(source, name=meta.get("name"))
+        return True
+    except Exception:  # noqa: BLE001 - surface the original retrieval error
+        log.exception("Could not re-index corrupt collection %s.", collection_name)
+        return False
+
+
 def _retrieve_with_rebuild(query: str, collection_name: str, k: int) -> str:
-    """Retrieve, self-healing corrupt on-disk stores with a wipe + retry."""
+    """Retrieve, re-indexing only the failing collection when it is corrupt."""
     try:
         return _retrieve_once(query, collection_name, k)
     except Exception as exc:  # noqa: BLE001
         if not _is_persist_corruption_error(exc):
             raise
-        log.warning("Store unusable during retrieval (%s); wiping and retrying.", exc)
-        _rebuild_store()
-        try:
-            return _retrieve_once(query, collection_name, k)
-        except Exception as retry_exc:  # noqa: BLE001
-            raise retry_exc from exc
+        log.warning(
+            "Collection %s unusable during retrieval (%s); re-indexing it.",
+            collection_name, exc,
+        )
+        if not _reindex_collection(collection_name):
+            raise
+        return _retrieve_once(query, collection_name, k)
 
 
 # ---- Uploaded-PDF support ----------------------------------------------------
@@ -662,6 +699,10 @@ def set_active_collection(collection_name: Optional[str]) -> None:
     """
     global _ACTIVE_COLLECTION
     _ACTIVE_COLLECTION = collection_name or None
+    if _ACTIVE_COLLECTION:
+        # An indexed document and a raw document must never both be active:
+        # retrieval would otherwise answer from the wrong file.
+        set_active_raw(None)
     try:
         _persist_dir().mkdir(parents=True, exist_ok=True)
         path = _active_collection_path()
@@ -694,7 +735,7 @@ def active_source_label() -> Optional[str]:
     Returns None while no document is active so the LLM is not nudged by
     extra context it does not need.
     """
-    collection_name = _ACTIVE_COLLECTION
+    collection_name = active_collection()
     if not collection_name:
         return None
     label = collection_name
@@ -726,7 +767,6 @@ def list_indexed_documents() -> list[dict]:
 
 def remove_indexed_document(collection_name: str) -> None:
     """Delete an uploaded document's collection, markers, and metadata."""
-    global _ACTIVE_COLLECTION
     try:
         _get_vectorstore(collection_name).delete_collection()
     except Exception:  # noqa: BLE001
@@ -757,7 +797,7 @@ def retrieve_active_chunks(query: str = DEFAULT_QUERY, k: int = DEFAULT_TOP_K) -
                 "The active document is in raw mode (RAG disabled) — here is "
                 "its full text; answer strictly from it.\n\n" + full_text
             )
-    collection_name = _ACTIVE_COLLECTION
+    collection_name = active_collection()
     if not collection_name:
         return (
             "No document has been uploaded to the RAG retriever yet. "
@@ -804,6 +844,9 @@ def set_active_raw(raw_id: Optional[str]) -> None:
     """
     global _ACTIVE_RAW
     _ACTIVE_RAW = raw_id or None
+    if _ACTIVE_RAW:
+        # Selecting a raw document supersedes any indexed selection.
+        set_active_collection(None)
     try:
         _persist_dir().mkdir(parents=True, exist_ok=True)
         path = _raw_active_path()

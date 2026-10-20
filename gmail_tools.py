@@ -31,10 +31,12 @@ from __future__ import annotations
 
 import asyncio
 import atexit
+import base64
 import concurrent.futures
 import json
 import logging
 import os
+import re
 import shlex
 import threading
 from pathlib import Path
@@ -340,10 +342,57 @@ def _summarize_gmail_output(text: str) -> str:
     return text
 
 
-def _format_single_message(msg: dict) -> str:
-    """Format a single Gmail message dict into a readable one-liner.
+def _decode_body_data(data: str) -> str:
+    """Decode a base64url Gmail body part."""
+    if not isinstance(data, str) or not data:
+        return ""
+    try:
+        padded = data + "=" * (-len(data) % 4)
+        return base64.urlsafe_b64decode(padded).decode("utf-8", "replace")
+    except (ValueError, TypeError):
+        return ""
 
-    Handles both full messages (with payload.headers) and lightweight
+
+def _extract_message_body(payload: dict, max_chars: int = 4000) -> str:
+    """Return readable body text (prefer text/plain) from a Gmail payload."""
+    if not isinstance(payload, dict):
+        return ""
+
+    plain: list[str] = []
+    html_parts: list[str] = []
+    stack = [payload]
+    while stack:
+        part = stack.pop(0)
+        if not isinstance(part, dict):
+            continue
+        mime = str(part.get("mimeType", ""))
+        body = part.get("body") or {}
+        decoded = _decode_body_data(body.get("data") or "")
+        if decoded:
+            if mime == "text/plain":
+                plain.append(decoded)
+            elif mime == "text/html":
+                html_parts.append(decoded)
+        stack.extend(part.get("parts") or [])
+
+    if plain:
+        text = "\n".join(plain)
+    elif html_parts:
+        text = re.sub(r"<(script|style)[^>]*>.*?</\1>", " ", " ".join(html_parts), flags=re.I | re.S)
+        text = re.sub(r"<[^>]+>", " ", text)
+        text = re.sub(r"\s+", " ", text)
+    else:
+        return ""
+    text = text.strip()
+    if len(text) > max_chars:
+        text = text[:max_chars].rstrip() + "\n...[body truncated]"
+    return text
+
+
+def _format_single_message(msg: dict) -> str:
+    """Format a single Gmail message dict into a readable summary.
+
+    Handles both full messages (with payload.headers/body) and lightweight
     list_messages responses (only id/threadId/snippet).
     """
     import json
@@ -379,6 +428,9 @@ def _format_single_message(msg: dict) -> str:
         parts.append(f"Date: {date}")
     if snippet:
         parts.append(snippet)
+    body = _extract_message_body(payload)
+    if body:
+        parts.append(f"Body:\n{body}")
 
     return " | ".join(parts)
 

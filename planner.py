@@ -166,7 +166,7 @@ _HOURLY_RE = re.compile(r"\b(?:hourly|every\s+hour)\b", re.IGNORECASE)
 _DAILY_RE = re.compile(r"\b(?:daily|every\s+day)\b", re.IGNORECASE)
 _ABSOLUTE_TIME_RE = re.compile(
     r"""
-    \b(?:at\s+)?
+    \b(?P<at>at\s+)?
     (?P<hour>\d{1,2})           # 3 or 15
     (?::(?P<minute>\d{2}))?     # optional :30
     \s*(?P<ampm>am|pm)?         # optional am/pm
@@ -181,7 +181,8 @@ _IN_MINUTES_RE = re.compile(
     re.IGNORECASE,
 )
 _SCHEDULE_HINT_RE = re.compile(
-    r"\b(?:every|each|repeat|monitor|refresh|again|later|hourly|daily|at\s+\d|tomorrow|tonight)\b",
+    r"\b(?:every|each|repeat|monitor|refresh|again|later|hourly|daily|"
+    r"at\s+\d{1,2}(?::\d{2})?\s*(?:am|pm)?|tomorrow|tonight)\b",
     re.IGNORECASE,
 )
 
@@ -213,26 +214,35 @@ def _unit_to_minutes(value: float, unit: str) -> float:
     return value  # minutes
 
 
+def _local_wall_time_to_utc(naive: datetime) -> datetime:
+    """Resolve a naive local wall-clock time to UTC, honoring DST.
+
+    `datetime.now().astimezone()` carries a fixed offset, so adding a day
+    across a DST boundary lands an hour off. `time.mktime` asks the OS to
+    resolve the local wall time with the correct offset for that date.
+    """
+    return datetime.fromtimestamp(time.mktime(naive.timetuple())).astimezone(
+        timezone.utc
+    )
+
+
 def _parse_absolute_start(prompt: str) -> Optional[datetime]:
     """Best-effort absolute-time parser. Returns UTC datetime or None."""
-    now = datetime.now().astimezone()
+    now_local = datetime.now()
 
     match = _IN_MINUTES_RE.search(prompt)
     if match:
         value = _parse_number_token(match.group("value"))
         minutes = _unit_to_minutes(value, match.group("unit"))
-        return (now + timedelta(minutes=minutes)).astimezone(timezone.utc)
+        return datetime.now(timezone.utc) + timedelta(minutes=minutes)
 
-    # Absolute clock time. Require an explicit "at" prefix, am/pm suffix, or
-    # a tomorrow/tonight nearby — otherwise bare digits in prompts like "2 + 2"
-    # get misread as clock times.
-    matches = list(_ABSOLUTE_TIME_RE.finditer(prompt))
-    has_relative_day = bool(_TOMORROW_RE.search(prompt) or _TONIGHT_RE.search(prompt))
-    for time_match in matches:
-        preceding = prompt[max(0, time_match.start() - 4): time_match.start()].lower()
-        has_at_prefix = preceding.rstrip().endswith("at")
+    # Absolute clock time. Require an explicit "at" prefix or am/pm suffix;
+    # otherwise bare digits in prompts like "2 + 2" or "tomorrow to buy 2
+    # apples" get misread as clock times.
+    for time_match in _ABSOLUTE_TIME_RE.finditer(prompt):
+        has_at_prefix = bool(time_match.group("at"))
         has_ampm = bool(time_match.group("ampm"))
-        if not (has_at_prefix or has_ampm or has_relative_day):
+        if not (has_at_prefix or has_ampm):
             continue
         # Skip if the number is part of "X minutes"/"X times" phrasing
         following = prompt[time_match.end(): time_match.end() + 12].lower()
@@ -254,19 +264,21 @@ def _parse_absolute_start(prompt: str) -> Optional[datetime]:
         if hour > 23 or minute > 59:
             continue
 
-        base = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+        base = now_local.replace(hour=hour, minute=minute, second=0, microsecond=0)
         if _TOMORROW_RE.search(prompt):
             base += timedelta(days=1)
         elif _TONIGHT_RE.search(prompt) and hour < 18:
             base += timedelta(days=1)
-        elif base <= now:
+        elif base <= now_local:
             base += timedelta(days=1)
-        return base.astimezone(timezone.utc)
+        return _local_wall_time_to_utc(base)
 
     if _TOMORROW_RE.search(prompt):
         # No explicit time — default to 9am tomorrow
-        target = (now + timedelta(days=1)).replace(hour=9, minute=0, second=0, microsecond=0)
-        return target.astimezone(timezone.utc)
+        target = (now_local + timedelta(days=1)).replace(
+            hour=9, minute=0, second=0, microsecond=0
+        )
+        return _local_wall_time_to_utc(target)
 
     return None
 
@@ -315,37 +327,56 @@ def strip_schedule_phrases(prompt: str) -> str:
 def _fallback_search_plan(prompt: str) -> SearchPlan:
     """Recover common phrasings when the local model rejects JSON mode."""
     duration_match = _DURATION_RE.search(prompt)
+    every_hint = bool(re.search(r"\b(?:every|each)\b", prompt, re.IGNORECASE))
+    hourly_hint = bool(_HOURLY_RE.search(prompt))
+    daily_hint = bool(_DAILY_RE.search(prompt))
+    in_duration_hint = bool(_IN_MINUTES_RE.search(prompt))
+    repeat_verb_hint = bool(
+        re.search(r"\b(?:repeat|monitor|refresh)\b", prompt, re.IGNORECASE)
+    )
+    absolute_start = _parse_absolute_start(prompt)
+
+    # A duration alone is not a schedule ("the movie is 90 minutes long").
+    # Require an explicit recurrence, a delay ("in 5 minutes"), or an
+    # absolute start time.
+    recurrence_hint = bool(
+        (every_hint and (duration_match or re.search(
+            r"\b(?:hour|day|week|month)\b", prompt, re.IGNORECASE
+        )))
+        or hourly_hint
+        or daily_hint
+        or in_duration_hint
+        or repeat_verb_hint
+    )
     schedule_requested = bool(
-        duration_match
-        or _SCHEDULE_HINT_RE.search(prompt)
+        recurrence_hint
+        or absolute_start
+        or re.search(r"\b(?:again|later)\b", prompt, re.IGNORECASE)
     )
 
     wait_minutes = 0.0
-    every_hint = bool(re.search(r"\b(?:every|each)\b", prompt, re.IGNORECASE))
     if duration_match and every_hint:
         value = _parse_number_token(duration_match.group("value"))
         wait_minutes = _unit_to_minutes(value, duration_match.group("unit"))
-    elif _HOURLY_RE.search(prompt):
+    elif hourly_hint:
         wait_minutes = 60.0
-    elif _DAILY_RE.search(prompt):
+    elif daily_hint:
         wait_minutes = 60.0 * 24
-    elif schedule_requested and every_hint:
+    elif schedule_requested and not absolute_start:
         wait_minutes = DEFAULT_AUTO_WAIT_MINUTES
 
     count_match = _COUNT_RE.search(prompt)
     run_count = int(_parse_number_token(count_match.group("count"))) if count_match else 1
-    # Only default to multiple runs when the user actually asked for repetition.
-    if schedule_requested and every_hint and not count_match:
+    # Hourly/daily/monitor requests are open-ended; keep them bounded at two
+    # runs instead of silently doing a single run.
+    if recurrence_hint and not count_match and not absolute_start:
         run_count = 2
 
-    absolute_start = _parse_absolute_start(prompt)
     # An absolute start counts as scheduling too, even without "every".
     if absolute_start and not schedule_requested:
         schedule_requested = True
-        run_count = 1
-        wait_minutes = 0.0
-    elif absolute_start and not every_hint and not count_match:
-        # "remind me after 2 minutes" - one-shot at the absolute time.
+    if absolute_start and not every_hint and not count_match:
+        # "remind me at 3pm" / "in 2 minutes" - one-shot at that instant.
         run_count = 1
         wait_minutes = 0.0
 
@@ -537,6 +568,24 @@ def _is_cheap_prompt(prompt: str) -> bool:
     return bool(_CHEAP_CALCULATOR_RE.match(prompt) or _CHEAP_TIME_RE.match(prompt))
 
 
+def _normalize_absolute_start(value: object) -> Optional[str]:
+    """Validate an ISO timestamp and normalize it to UTC.
+
+    LLM output occasionally omits the timezone or returns a non-ISO string.
+    Naive timestamps are interpreted as local wall time; unparseable values
+    are discarded so a malformed plan cannot fire at an arbitrary moment.
+    """
+    if not isinstance(value, str) or not value.strip():
+        return None
+    try:
+        when = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if when.tzinfo is None:
+        when = _local_wall_time_to_utc(when)
+    return when.astimezone(timezone.utc).isoformat()
+
+
 def _clamp_plan(plan: SearchPlan) -> SearchPlan:
     query = plan.search_query.strip() or "current information"
     try:
@@ -552,15 +601,17 @@ def _clamp_plan(plan: SearchPlan) -> SearchPlan:
         run_count = 1
     run_count = max(1, min(run_count, config.MAX_AUTO_RUNS))
 
-    should_schedule = bool(plan.should_schedule) or bool(plan.absolute_start_iso)
-    if should_schedule and wait_minutes == 0 and run_count > 1:
+    absolute_start_iso = _normalize_absolute_start(plan.absolute_start_iso)
+    should_schedule = bool(plan.should_schedule) or bool(absolute_start_iso)
+    if should_schedule and wait_minutes == 0 and not absolute_start_iso:
         wait_minutes = DEFAULT_AUTO_WAIT_MINUTES
     if not should_schedule:
         wait_minutes = 0.0
         run_count = 1
 
-    # Keep any LLM-generated interval within the same bound as the wait tool.
-    wait_minutes = min(wait_minutes, config.WAIT_MAX_SECONDS / 60)
+    # Scheduling intervals are independent of the single `wait` tool's bound;
+    # "every 6 hours" and "daily" must not silently become hourly.
+    wait_minutes = min(wait_minutes, config.MAX_SCHEDULE_INTERVAL_MINUTES)
 
     # Validate task_type; unknown values collapse to 'search'.
     task_type: TaskType = plan.task_type if plan.task_type in (
@@ -575,7 +626,7 @@ def _clamp_plan(plan: SearchPlan) -> SearchPlan:
         should_schedule=should_schedule,
         wait_minutes=wait_minutes,
         run_count=run_count,
-        absolute_start_iso=plan.absolute_start_iso,
+        absolute_start_iso=absolute_start_iso,
     )
 
 

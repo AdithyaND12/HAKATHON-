@@ -108,6 +108,11 @@ LM_STUDIO_BASE_URL = "Gemini API"
 ALPHAVANTAGE_API_KEY = env_str("ALPHAVANTAGE_API_KEY")
 HTTP_TIMEOUT_SECONDS = env_float("HTTP_TIMEOUT_SECONDS", DEFAULT_HTTP_TIMEOUT_SECONDS)
 WAIT_MAX_SECONDS = env_float("WAIT_MAX_SECONDS", DEFAULT_WAIT_MAX_SECONDS)
+# Recurrence intervals are not bounded by the wait tool's limit: "every 6
+# hours" or "daily" are valid schedules. Cap at one week to stay bounded.
+MAX_SCHEDULE_INTERVAL_MINUTES = env_float(
+    "MAX_SCHEDULE_INTERVAL_MINUTES", 7 * 24 * 60
+)
 MAX_AUTO_RUNS = env_int("MAX_AUTO_RUNS", DEFAULT_MAX_AUTO_RUNS)
 DATA_DIR = env_path("HAKATHON_DATA_DIR", DEFAULT_DATA_DIR)
 # Chunks per embedding request to Jina (one HTTP POST per batch). Batches of
@@ -115,7 +120,14 @@ DATA_DIR = env_path("HAKATHON_DATA_DIR", DEFAULT_DATA_DIR)
 JINA_EMBEDDING_BATCH_SIZE = env_int("JINA_EMBEDDING_BATCH_SIZE", 32)
 
 # Embedding provider: "jina" (default, free tier) or "google" (Gemini embeddings).
-EMBEDDING_PROVIDER = env_str("EMBEDDING_PROVIDER", DEFAULT_EMBEDDING_PROVIDER)
+_configured_embedding_provider = env_str(
+    "EMBEDDING_PROVIDER", DEFAULT_EMBEDDING_PROVIDER
+).lower()
+EMBEDDING_PROVIDER = (
+    _configured_embedding_provider
+    if _configured_embedding_provider in {"jina", "google"}
+    else DEFAULT_EMBEDDING_PROVIDER
+)
 GOOGLE_EMBEDDING_MODEL = env_str("GOOGLE_EMBEDDING_MODEL", DEFAULT_GEMINI_EMBEDDING_MODEL)
 GOOGLE_EMBEDDING_BATCH_SIZE = env_int("GOOGLE_EMBEDDING_BATCH_SIZE", 32)
 

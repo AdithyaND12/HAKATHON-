@@ -93,3 +93,56 @@ def test_planner_search_instruction_mentions_gmail_tools():
     assert "web search tool" in text
     assert "never display them" in text
     assert "JSON code blocks" in text
+
+# ---- Gmail OAuth token safety and message-body extraction --------------------
+
+
+def test_token_path_rejects_directory_traversal(monkeypatch, tmp_path):
+    import gmail_client
+
+    monkeypatch.setattr(config, "GMAIL_TOKENS_DIR", tmp_path)
+
+    assert gmail_client.is_valid_session_id("abc123")
+    assert not gmail_client.is_valid_session_id("../conversations")
+    assert not gmail_client.is_valid_session_id("a/b")
+    with pytest.raises(ValueError):
+        gmail_client._token_path("../conversations")
+
+
+def test_oauth_state_must_have_been_issued(monkeypatch):
+    import gmail_client
+
+    monkeypatch.setattr(config, "GOOGLE_OAUTH_CLIENT_ID", "client-id")
+    monkeypatch.setattr(config, "GOOGLE_OAUTH_CLIENT_SECRET", "client-secret")
+    with gmail_client._ISSUED_STATES_LOCK:
+        gmail_client._ISSUED_STATES.clear()
+
+    url = gmail_client.get_auth_url("abc123")
+    assert "state=abc123" in url
+    assert gmail_client.consume_oauth_state("abc123")
+    assert not gmail_client.consume_oauth_state("abc123")
+    assert not gmail_client.consume_oauth_state("../conversations")
+
+
+def test_single_message_includes_decoded_body():
+    import base64
+
+    body = base64.urlsafe_b64encode(b"Hello from the email body").decode()
+    msg = {
+        "snippet": "short snippet",
+        "payload": {
+            "mimeType": "multipart/alternative",
+            "headers": [
+                {"name": "From", "value": "alice@example.com"},
+                {"name": "Subject", "value": "Hello"},
+            ],
+            "parts": [
+                {"mimeType": "text/plain", "body": {"data": body}},
+            ],
+        },
+    }
+
+    out = gmail_tools._format_single_message(msg)
+
+    assert "Hello from the email body" in out
+    assert "alice@example.com" in out

@@ -153,3 +153,63 @@ def test_planner_non_format_error_propagates(monkeypatch):
 
     with pytest.raises(RuntimeError, match="connection refused"):
         planner._invoke_search_planner([{"role": "user", "content": "hi"}])
+
+
+# ---- Regression tests for interval/time parsing bugs -------------------------
+
+
+def test_long_intervals_are_not_capped_to_the_wait_tool_limit():
+    """A 6-hour recurrence must stay 6 hours; the wait tool's 1h bound is
+    unrelated to scheduling."""
+    plan = planner._clamp_plan(
+        planner.SearchPlan(
+            search_query="news",
+            should_schedule=True,
+            wait_minutes=6 * 60,
+            run_count=2,
+        )
+    )
+    assert plan.wait_minutes == 6 * 60
+
+
+def test_daily_fallback_keeps_24_hour_interval():
+    plan = planner.fallback_search_plan("check python news daily")
+    assert plan.should_schedule
+    assert plan.wait_minutes == 24 * 60
+
+
+def test_hourly_monitor_defaults_to_two_runs():
+    plan = planner.fallback_search_plan("monitor python news hourly")
+    assert plan.should_schedule
+    assert plan.wait_minutes == 60
+    assert plan.run_count == 2
+
+
+def test_at_prefix_without_ampm_is_parsed():
+    when = planner._parse_absolute_start("remind me at 15:30")
+    assert when is not None
+    local = when.astimezone()
+    assert (local.hour, local.minute) == (15, 30)
+
+
+def test_bare_number_after_tomorrow_is_not_a_clock_time():
+    """'tomorrow to buy 2 apples' must use the 9am default, not 02:00."""
+    when = planner._parse_absolute_start("remind me tomorrow to buy 2 apples")
+    assert when is not None
+    assert when.astimezone().hour == 9
+
+
+def test_duration_without_recurrence_is_not_scheduling():
+    plan = planner.fallback_search_plan("the movie is 90 minutes long")
+    assert not plan.should_schedule
+    assert plan.run_count == 1
+    assert plan.wait_minutes == 0
+
+
+def test_absolute_start_is_normalized_to_utc():
+    assert planner._normalize_absolute_start("2030-01-01T09:00:00+02:00") == (
+        "2030-01-01T07:00:00+00:00"
+    )
+    naive = planner._normalize_absolute_start("2030-01-01T09:00:00")
+    assert naive is not None and naive.endswith("+00:00")
+    assert planner._normalize_absolute_start("tomorrow at 9") is None

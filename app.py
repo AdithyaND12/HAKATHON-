@@ -67,6 +67,8 @@ from waggle_tools import WAGGLE_MEMORY_POLICY, init_waggle_tools, memorize_turn,
 
 load_dotenv()
 
+log = logging.getLogger(__name__)
+
 # Guard rails for the agent loop and CLI robustness.
 CHAT_RECURSION_LIMIT = 10
 MAX_CONTEXT_TOKENS = 10000
@@ -448,7 +450,11 @@ def _invoke_chatbot(state: dict) -> dict:
         out = chatbot.invoke(
             state, config={"recursion_limit": CHAT_RECURSION_LIMIT}
         )
-    except TypeError:
+    except TypeError as exc:
+        # Only tolerate the strict-test-double signature. A TypeError raised
+        # *inside* the graph must not trigger a second, side-effectful run.
+        if "unexpected keyword argument" not in str(exc) or "config" not in str(exc):
+            raise
         out = chatbot.invoke(state)
     except GraphRecursionError:
         raise
@@ -488,7 +494,7 @@ def _memorize_last_turn(
             user_message, assistant_response, session_id=session_id, block=False
         )
     except Exception:  # noqa: BLE001 - memory must never break the chat
-        logger.exception("Waggle memorize_turn failed")
+        log.exception("Waggle memorize_turn failed")
 
 
 scheduler = Scheduler(

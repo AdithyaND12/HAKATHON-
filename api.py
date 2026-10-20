@@ -7,7 +7,7 @@ import uuid
 from contextlib import asynccontextmanager
 from typing import Any, Dict, List, Optional
 
-from fastapi import FastAPI, File, HTTPException, Query, UploadFile, status
+from fastapi import Depends, FastAPI, File, HTTPException, Query, UploadFile, status
 from fastapi.responses import RedirectResponse
 from pydantic import BaseModel, Field
 from langchain_core.messages import HumanMessage, SystemMessage
@@ -80,7 +80,7 @@ async def chat(request: ChatRequest):
     """Run a single one-off chat query through the LangGraph chatbot."""
     try:
         plan = create_search_plan(request.prompt)
-    except Exception as exc:
+    except Exception:
         plan = SearchPlan(
             search_query=request.prompt,
             should_schedule=False,
@@ -207,33 +207,60 @@ async def list_documents():
     """List all indexed PDF documents in RAG."""
     return ragtool.list_indexed_documents()
 
+MAX_UPLOAD_BYTES = 50 * 1024 * 1024
+
+
 @app.post("/documents/upload")
 async def upload_document(file: UploadFile = File(...)):
     """Upload a PDF, index it using Jina Embeddings, and activate it for RAG queries."""
-    if not file.filename.endswith(".pdf"):
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Only PDF files are supported")
-    
-    content = await file.read()
-    sha = hashlib.sha256(content).hexdigest()
-    
+    filename = (file.filename or "").strip()
+    if not filename.lower().endswith(".pdf"):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Only PDF files are supported",
+        )
+
+    content = bytearray()
+    while True:
+        chunk = await file.read(1024 * 1024)
+        if not chunk:
+            break
+        content.extend(chunk)
+        if len(content) > MAX_UPLOAD_BYTES:
+            raise HTTPException(
+                status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+                detail=f"PDF exceeds the {MAX_UPLOAD_BYTES // (1024 * 1024)} MB limit.",
+            )
+    if not bytes(content[:5]).startswith(b"%PDF-"):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="File does not look like a PDF.",
+        )
+
+    sha = hashlib.sha256(bytes(content)).hexdigest()
+
     uploads_dir = config.DATA_DIR / "uploads"
     uploads_dir.mkdir(parents=True, exist_ok=True)
-    safe_name = re.sub(r"[^A-Za-z0-9._-]+", "_", file.filename)
+    safe_name = re.sub(r"[^A-Za-z0-9._-]+", "_", filename)
     target_path = uploads_dir / f"{sha[:16]}_{safe_name}"
-    
+
     try:
         target_path.write_bytes(content)
-        count = ragtool.index_pdf(target_path, name=file.filename)
+        count = ragtool.index_pdf(target_path, name=filename)
     except Exception as exc:
-        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Indexing failed: {exc}")
-    
+        target_path.unlink(missing_ok=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Indexing failed: {exc}",
+        )
+
     collection_name = ragtool.collection_name_for_sha(sha)
     ragtool.set_active_collection(collection_name)
-    
+
     return {
-        "message": f"Successfully indexed {file.filename}",
+        "message": f"Successfully indexed {filename}",
         "chunks": count,
-        "collection_name": collection_name
+        "collection_name": collection_name,
     }
 
 @app.post("/documents/active")
@@ -245,6 +272,16 @@ async def set_active_document(request: ActiveDocumentRequest):
 
 # ---- Gmail OAuth endpoints ------------------------------------------------
 
+def require_gmail_session(session_id: str = Query(...)) -> str:
+    """Reject session ids that could escape the token directory."""
+    if not gmail_client.is_valid_session_id(session_id):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid Gmail session_id.",
+        )
+    return session_id
+
+
 @app.get("/gmail/auth")
 async def gmail_auth(session_id: str = Query(default=None)):
     """Redirect to Google's OAuth consent screen.
@@ -252,8 +289,13 @@ async def gmail_auth(session_id: str = Query(default=None)):
     Generates a unique session_id if none provided, stores it in the
     redirect URL so the callback can route tokens back.
     """
-    if not session_id:
+    if session_id is None:
         session_id = uuid.uuid4().hex[:12]
+    elif not gmail_client.is_valid_session_id(session_id):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid Gmail session_id.",
+        )
     try:
         url = gmail_client.get_auth_url(session_id)
     except RuntimeError as exc:
@@ -269,7 +311,12 @@ async def gmail_callback(code: str = Query(...), state: str = Query(default=""))
     """Handle Google OAuth redirect: exchange code for tokens, then redirect
     back to the Streamlit app with the session_id in the URL.
     """
-    session_id = state or uuid.uuid4().hex[:12]
+    if not gmail_client.consume_oauth_state(state):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid or expired OAuth state. Restart the sign-in flow.",
+        )
+    session_id = state
     try:
         gmail_client.exchange_code(code, session_id)
     except Exception as exc:
@@ -283,7 +330,7 @@ async def gmail_callback(code: str = Query(...), state: str = Query(default=""))
 
 
 @app.get("/gmail/status")
-async def gmail_status(session_id: str = Query(...)):
+async def gmail_status(session_id: str = Depends(require_gmail_session)):
     """Check whether the given session has valid Gmail tokens."""
     connected = gmail_client.is_connected(session_id)
     profile = None
@@ -299,7 +346,7 @@ async def gmail_status(session_id: str = Query(...)):
 
 
 @app.post("/gmail/disconnect")
-async def gmail_disconnect(session_id: str = Query(...)):
+async def gmail_disconnect(session_id: str = Depends(require_gmail_session)):
     """Delete stored Gmail tokens for the given session."""
     gmail_client.delete_tokens(session_id)
     return {"message": "Gmail disconnected"}
@@ -307,7 +354,7 @@ async def gmail_disconnect(session_id: str = Query(...)):
 
 @app.get("/gmail/messages")
 async def gmail_list_messages(
-    session_id: str = Query(...),
+    session_id: str = Depends(require_gmail_session),
     query: str = Query(default=""),
     max_results: int = Query(default=20, ge=1, le=100),
 ):
@@ -329,7 +376,7 @@ async def gmail_list_messages(
 @app.get("/gmail/messages/{msg_id}")
 async def gmail_get_message(
     msg_id: str,
-    session_id: str = Query(...),
+    session_id: str = Depends(require_gmail_session),
 ):
     """Get a single Gmail message by ID."""
     if not gmail_client.is_connected(session_id):
@@ -348,7 +395,7 @@ async def gmail_get_message(
 
 @app.post("/gmail/send")
 async def gmail_send_message(
-    session_id: str = Query(...),
+    session_id: str = Depends(require_gmail_session),
     to: str = Query(...),
     subject: str = Query(...),
     body: str = Query(...),

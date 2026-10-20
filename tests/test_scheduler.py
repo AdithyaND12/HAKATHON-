@@ -121,7 +121,7 @@ def test_scheduler_retries_transient_failures(tmp_path):
     def flaky(state):
         attempts["n"] += 1
         if attempts["n"] < 3:
-            raise RuntimeError("transient")
+            raise RuntimeError("429 rate limit exceeded")
         return _fake_result("recovered")
 
     sched = Scheduler(
@@ -266,3 +266,93 @@ def test_pause_and_resume(tmp_path):
     assert job.status == "completed"
     assert len(invocations) == 3
     assert len(invocations) > before_resume
+
+
+# ---- Regression tests for resume/pause/retry bugs ----------------------------
+
+
+def test_load_persisted_skips_jobs_already_in_memory(tmp_path):
+    registry = _fresh_registry(tmp_path)
+    job = ScheduledSearchJob(id="known01", prompt="x", status="pending")
+    registry.register(job)
+
+    assert registry.load_persisted() == []
+
+
+def test_resume_does_not_duplicate_a_live_job(tmp_path):
+    registry = _fresh_registry(tmp_path)
+    live = ScheduledSearchJob(
+        id="live01", prompt="x", interval_minutes=1, run_count=2, status="running"
+    )
+    registry.register(live)
+
+    restored = Scheduler(registry, lambda state: _fake_result(), _dummy_builder).resume_persisted()
+
+    assert restored == []
+
+
+def test_resume_preserves_paused_status(tmp_path):
+    registry = _fresh_registry(tmp_path)
+    paused = ScheduledSearchJob(
+        id="paused01",
+        prompt="x",
+        interval_minutes=1,
+        run_count=2,
+        completed_runs=1,
+        status="paused",
+    )
+    registry.jobs_file.write_text(json.dumps([paused.to_dict()]), encoding="utf-8")
+
+    invocations = []
+    sched = Scheduler(registry, lambda state: invocations.append(1) or _fake_result(), _dummy_builder)
+    restored = sched.resume_persisted()
+
+    assert len(restored) == 1
+    job = registry.get("paused01")
+    assert job is not None
+    assert job.status == "paused"
+    assert job.pause_event.is_set()
+    time.sleep(0.2)
+    assert invocations == []
+
+    job.stop()
+    job.join(timeout=1)
+
+
+def test_absolute_start_is_cleared_after_the_first_run(tmp_path):
+    from datetime import datetime, timedelta, timezone
+
+    registry = _fresh_registry(tmp_path)
+    sched = Scheduler(registry, lambda state: _fake_result(), _dummy_builder)
+    past = (datetime.now(timezone.utc) - timedelta(seconds=1)).isoformat()
+
+    job = sched.start(
+        "x",
+        interval_minutes=0.001,
+        run_count=2,
+        search_query="x",
+        absolute_start_iso=past,
+    )
+    job.join(timeout=3)
+
+    assert job.completed_runs == 2
+    assert job.absolute_start_iso is None
+
+
+def test_non_transient_errors_are_not_retried(tmp_path):
+    registry = _fresh_registry(tmp_path)
+    attempts = {"n": 0}
+
+    def always_fail(state):
+        attempts["n"] += 1
+        raise RuntimeError("no dice")
+
+    sched = Scheduler(
+        registry, always_fail, _dummy_builder,
+        max_invoke_retries=3, invoke_retry_backoff=0.01,
+    )
+    job = sched.start("x", interval_minutes=0.001, run_count=1, search_query="x")
+    job.join(timeout=3)
+
+    assert job.status == "failed"
+    assert attempts["n"] == 1

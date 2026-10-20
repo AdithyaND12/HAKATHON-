@@ -11,13 +11,18 @@ import time
 from typing import Optional
 
 from langchain_community.tools import DuckDuckGoSearchRun
+from langchain_community.utilities import DuckDuckGoSearchAPIWrapper
 from langchain_core.tools import tool
 
 import config
 
 log = logging.getLogger(__name__)
 
-_search_backend = DuckDuckGoSearchRun(region=config.DUCKDUCKGO_REGION)
+# DuckDuckGoSearchRun has no `region` field; the region belongs on the
+# API wrapper. Passing it to the tool used to be silently ignored.
+_search_backend = DuckDuckGoSearchRun(
+    api_wrapper=DuckDuckGoSearchAPIWrapper(region=config.DUCKDUCKGO_REGION)
+)
 
 
 def _run_with_retries(query: str, max_retries: int, backoff: float) -> str:
