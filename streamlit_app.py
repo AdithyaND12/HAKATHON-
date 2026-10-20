@@ -674,6 +674,47 @@ if _last_seen and (datetime.now().timestamp() - _last_seen) < 15:
     _grace_active = True
 
 
+def _render_scheduled_run_card(run: dict) -> str:
+    """Return the HTML string for a single scheduled-run card."""
+    # Human-friendly time (HH:MM:SS).
+    ts_short = run["completed_at"]
+    try:
+        ts_short = datetime.fromisoformat(
+            run["completed_at"].replace("Z", "+00:00")
+        ).strftime("%H:%M:%S")
+    except (ValueError, AttributeError):
+        pass
+    return (
+        f'<div class="sched-card">'
+        f'<div class="sched-head">'
+        f'<span class="sched-badge">scheduled run</span>'
+        f'<span class="sched-jobid">{run["job_id"]}</span>'
+        f'<span class="sched-runno">run #{run["run_number"]}</span>'
+        f'<span class="sched-time">{ts_short}</span>'
+        f'</div>'
+        f'<div class="sched-body">{_markdown_to_html(run["content"])}</div>'
+        f'</div>'
+    )
+
+
+def _markdown_to_html(text: str) -> str:
+    """Very lightweight markdown → HTML for the sched-card body.
+
+    We deliberately do not pull in a full markdown lib — the LLM output is
+    usually simple lists and bold spans. Falls back to `<br>`-preserved text.
+    """
+    import html
+    import re
+    escaped = html.escape(text)
+    # **bold**
+    escaped = re.sub(r"\*\*(.+?)\*\*", r"<strong>\1</strong>", escaped)
+    # `code`
+    escaped = re.sub(r"`([^`]+)`", r"<code>\1</code>", escaped)
+    # newlines
+    escaped = escaped.replace("\n", "<br>")
+    return escaped
+
+
 def _record_scheduled_runs(runs: list[dict]) -> None:
     """Append scheduled-run cards for `runs` to their routed conversations.
 
@@ -1358,50 +1399,6 @@ if _active_now:
         f'<div class="sched-strip">{"".join(chips)}</div>',
         unsafe_allow_html=True,
     )
-
-
-# ---- Handle any newly-completed scheduled runs ------------------------------
-
-
-def _render_scheduled_run_card(run: dict) -> str:
-    """Return the HTML string for a single scheduled-run card."""
-    # Human-friendly time (HH:MM:SS).
-    ts_short = run["completed_at"]
-    try:
-        ts_short = datetime.fromisoformat(
-            run["completed_at"].replace("Z", "+00:00")
-        ).strftime("%H:%M:%S")
-    except (ValueError, AttributeError):
-        pass
-    return (
-        f'<div class="sched-card">'
-        f'<div class="sched-head">'
-        f'<span class="sched-badge">scheduled run</span>'
-        f'<span class="sched-jobid">{run["job_id"]}</span>'
-        f'<span class="sched-runno">run #{run["run_number"]}</span>'
-        f'<span class="sched-time">{ts_short}</span>'
-        f'</div>'
-        f'<div class="sched-body">{_markdown_to_html(run["content"])}</div>'
-        f'</div>'
-    )
-
-
-def _markdown_to_html(text: str) -> str:
-    """Very lightweight markdown → HTML for the sched-card body.
-
-    We deliberately do not pull in a full markdown lib — the LLM output is
-    usually simple lists and bold spans. Falls back to `<br>`-preserved text.
-    """
-    import html
-    import re
-    escaped = html.escape(text)
-    # **bold**
-    escaped = re.sub(r"\*\*(.+?)\*\*", r"<strong>\1</strong>", escaped)
-    # `code`
-    escaped = re.sub(r"`([^`]+)`", r"<code>\1</code>", escaped)
-    # newlines
-    escaped = escaped.replace("\n", "<br>")
-    return escaped
 
 
 # ---- Chat input --------------------------------------------------------------
