@@ -391,31 +391,28 @@ def test_conversation_to_markdown_strips_card_html(tmp_path, monkeypatch):
     assert "bold run" in md
 
 
-def test_render_live_runs_in_appends_cards_to_container(tmp_path, monkeypatch):
+def test_record_scheduled_runs_appends_cards_to_conversations(tmp_path, monkeypatch):
     app_mod, st = _stub_streamlit_and_load(tmp_path, monkeypatch)
     st.session_state["conversations"] = {"c1": {"title": "t", "messages": []}}
     st.session_state["active_conv"] = "c1"
     st.session_state["job_conv"] = {}
     st.session_state["seen_runs"] = set()
 
-    rendered = []
     run = {
         "job_id": "job-x",
         "run_number": 1,
         "completed_at": "2026-08-09T17:37:56.786280+00:00",
         "content": "run produced this",
     }
-    ok = app_mod._render_live_runs_in([run], lambda html, unsafe_allow_html: rendered.append(html))
-    assert ok is True
-    assert len(rendered) == 1 and "run produced this" in rendered[0]
+    app_mod._record_scheduled_runs([run])
     stored = st.session_state["conversations"]["c1"]["messages"]
     assert stored[-1]["kind"] == "scheduled_run"
-    # Runs routed to another chat render nothing for the active view.
+    assert "run produced this" in stored[-1]["content"]
+    # Runs routed to another chat land in that conversation, not the active one.
     st.session_state["conversations"]["other"] = {"title": "other chat", "messages": []}
     st.session_state["job_conv"]["job-x"] = "other"
-    rendered.clear()
-    app_mod._render_live_runs_in([run], lambda html, unsafe_allow_html: rendered.append(html))
-    assert rendered == []
+    app_mod._record_scheduled_runs([run])
+    assert len(st.session_state["conversations"]["c1"]["messages"]) == 1
     assert st.session_state["conversations"]["other"]["messages"][-1]["kind"] == "scheduled_run"
 
 

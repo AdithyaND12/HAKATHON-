@@ -656,12 +656,13 @@ if "resumed_once" not in st.session_state:
 
 # ---- Live scheduled-run polling ------------------------------------------------
 # Streamlit only reruns on interaction, so background scheduled runs would never
-# surface on their own. A fragment with `run_every` polls in the background and
-# appends newly-completed runs to a container created *outside* the fragment —
-# Streamlit accumulates those elements across fragment reruns, so the rest of
-# the page (chat history) is NOT redrawn on every poll tick. The fragment is
-# declared lazily at the bottom of the script, so it exists only while a job is
-# active (or within the short post-job grace window).
+# surface on their own. A fragment with `run_every="3s"` polls in the background.
+# When it sees a completed run it records the card into session state and calls
+# `st.rerun()`, so the chat-history loop (the single renderer) redraws with the
+# new card. A fragment must NOT write into a container created outside itself —
+# that raises StreamlitInvalidLayoutContextError during a fragment-only rerun.
+# The fragment is declared lazily at the bottom of the script, so it exists only
+# while a job is active (or within the short post-job grace window).
 
 _active_now = _registry.active()
 if _active_now:
@@ -673,11 +674,15 @@ if _last_seen and (datetime.now().timestamp() - _last_seen) < 15:
     _grace_active = True
 
 
-def _render_live_runs_in(runs: list[dict], render_fn) -> bool:
-    """Append scheduled-run cards for `runs` via `render_fn` (a callable like
-    `container.markdown` or `st.markdown`). Returns True when at least one card
-    was appended (i.e. user-visible work happened on this tick)."""
-    appended = False
+def _record_scheduled_runs(runs: list[dict]) -> None:
+    """Append scheduled-run cards for `runs` to their routed conversations.
+
+    Rendering is left to the chat-history loop so a fragment never has to write
+    into an element it does not own (which raises
+    StreamlitInvalidLayoutContextError during a fragment-only rerun).
+    """
+    if not runs:
+        return
     for run in runs:
         card_html = _render_scheduled_run_card(run)
         target = _route_scheduled_run(
@@ -692,26 +697,23 @@ def _render_live_runs_in(runs: list[dict], render_fn) -> bool:
                 "content": card_html,
             }
         )
-        if target == st.session_state.active_conv:
-            render_fn(card_html, unsafe_allow_html=True)
-            appended = True
-    if runs:
-        _persist_conversations(
-            st.session_state.conversations,
-            st.session_state.active_conv,
-            st.session_state.job_conv,
-        )
-    return appended
+    _persist_conversations(
+        st.session_state.conversations,
+        st.session_state.active_conv,
+        st.session_state.job_conv,
+    )
 
 
 @st.fragment(run_every="3s")
-def _poll_scheduled_runs(live_container) -> None:
+def _poll_scheduled_runs() -> None:
     """Background poller: surfaces completed scheduled runs while any job is
     active (or within the post-job grace window).
 
-    Runs as its own fragment so the full app is NOT rerun every interval. When
-    polling is no longer needed it triggers an app rerun so the main script can
-    stop declaring it (a fragment can't un-declare itself).
+    Runs as its own fragment so the full app is NOT rerun every interval. When a
+    new run completes it records the card and triggers a full app rerun so the
+    chat-history loop renders it. When polling is no longer needed it also
+    triggers an app rerun so the main script can stop declaring the fragment (a
+    fragment can't un-declare itself).
     """
     job_count = len(_registry.active())
     if job_count:
@@ -719,7 +721,8 @@ def _poll_scheduled_runs(live_container) -> None:
 
     new_runs = _fetch_new_scheduled_runs()
     if new_runs:
-        _render_live_runs_in(new_runs, live_container.markdown)
+        _record_scheduled_runs(new_runs)
+        st.rerun()
 
     # No active jobs and past the grace window: tear the poller down via an app
     # rerun. The main script will see stale `_last_active_at` and not re-declare
@@ -1288,6 +1291,14 @@ with st.sidebar:
         st.toast(f"Cancelled {len(_registry.active())} job(s)")
 
 
+# ---- Record newly-completed scheduled runs ------------------------------------
+# Surface any run that finished since the last render (e.g. while the page was
+# idle or during a user-triggered rerun). The chat-history loop below is the
+# single renderer, so we only record here — never render into a fragment-owned
+# element.
+_record_scheduled_runs(_fetch_new_scheduled_runs())
+
+
 # ---- Render chat history -----------------------------------------------------
 
 active_chat = st.session_state.conversations[st.session_state.active_conv]
@@ -1393,21 +1404,13 @@ def _markdown_to_html(text: str) -> str:
     return escaped
 
 
-new_runs = _fetch_new_scheduled_runs()
-if new_runs:
-    # Render completed runs as inline cards in the chat flow. Runs completed
-    # *while the page is idle* are handled by the background poller instead.
-    _render_live_runs_in(new_runs, st.markdown)
-
-
 # ---- Chat input --------------------------------------------------------------
 
 # Declare the background poller only while a job is active (or within the grace
-# window). The container is created here — below the history — so live cards
-# accumulate at the bottom of the page, above the input.
+# window). It writes no elements of its own — it records new runs into session
+# state and triggers a full rerun so the chat-history loop renders them.
 if _active_now or _grace_active:
-    _live_container = st.container()
-    _poll_scheduled_runs(_live_container)
+    _poll_scheduled_runs()
 
 prompt = st.chat_input("ask anything · try 'search AI news every 5 min for 3 times'")
 
