@@ -38,7 +38,6 @@ import config
 from planner import (
     CalculationExecutionInstruction,
     ChatExecutionInstruction,
-    EmailExecutionInstruction,
     RagExecutionInstruction,
     ReminderExecutionInstruction,
     SearchExecutionInstruction,
@@ -62,8 +61,6 @@ from scheduler import (
 )
 from tools_search import search_tool
 from ragtool import retrieve_active_chunks
-from gmail_tools import init_gmail_tools
-from waggle_tools import WAGGLE_MEMORY_POLICY, init_waggle_tools, memorize_turn, prime_session
 
 load_dotenv()
 
@@ -212,17 +209,6 @@ SCHEDULED_RUN_INSTRUCTIONS = (
 )
 
 agent_tools = [get_stock_price, search_tool, calculator, get_rag_chunks, get_time]
-
-# Optional Gmail tools (gmail_mcp): inbox reads + mailbox writes. Fail-open:
-# when the MCP server or auth is unavailable, init_gmail_tools() logs a
-# warning and returns [].
-agent_tools += init_gmail_tools()
-
-# Optional Waggle memory tools (waggle_mcp): persistent cross-session recall.
-# Read-only surface (query_graph / prime_context / get_stats); writes happen
-# through the runtime hooks. Fail-open: a missing server logs a warning and
-# returns [].
-agent_tools += init_waggle_tools()
 
 llm_with_tools = llm.bind_tools(agent_tools)
 scheduled_llm_with_tools = llm.bind_tools(agent_tools)
@@ -424,13 +410,6 @@ def _build_messages(prompt: str, search_query: str, task_type: str = "search",
             HumanMessage(content=clean_prompt),
         ]
 
-    if task_type == "email":
-        return [
-            SystemMessage(content=SCHEDULED_RUN_INSTRUCTIONS),
-            SystemMessage(content=EmailExecutionInstruction(clean_prompt).render()),
-            HumanMessage(content=clean_prompt),
-        ]
-
     # Default: search
     return [
         SystemMessage(content=SCHEDULED_RUN_INSTRUCTIONS),
@@ -458,43 +437,7 @@ def _invoke_chatbot(state: dict) -> dict:
         out = chatbot.invoke(state)
     except GraphRecursionError:
         raise
-    # Completed runs produce durable digests (prices, news summaries) worth
-    # remembering. Best-effort and never blocking: failures are logged inside.
-    session_id = "scheduled" if _is_scheduled_run(state.get("messages", [])) else "cli"
-    _memorize_last_turn(state.get("messages", []), out, session_id=session_id)
     return out
-
-
-def _memorize_last_turn(
-    messages: list[BaseMessage], out: dict, *, session_id: str
-) -> None:
-    """Store the last user/assistant turn into Waggle memory (best-effort).
-
-    Extracts the final human message from the input state and the final
-    assistant reply from the invocation result, then fires
-    observe_conversation on the memory loop thread. Always a no-op when the
-    feature is disabled; never raises.
-    """
-    try:
-        user_message = ""
-        for message in reversed(messages):
-            if isinstance(message, HumanMessage):
-                user_message = _message_text(message).strip()
-                break
-        if not user_message:
-            return
-        assistant_response = ""
-        for message in reversed(out.get("messages", [])):
-            if not isinstance(message, (HumanMessage, SystemMessage)):
-                assistant_response = _message_text(message).strip()
-                break
-        if not assistant_response:
-            return
-        memorize_turn(
-            user_message, assistant_response, session_id=session_id, block=False
-        )
-    except Exception:  # noqa: BLE001 - memory must never break the chat
-        log.exception("Waggle memorize_turn failed")
 
 
 scheduler = Scheduler(
@@ -621,7 +564,6 @@ def _run_one_off(user_input: str, plan: SearchPlan) -> None:
         out = _invoke_chatbot(
             {
                 "messages": [
-                    SystemMessage(content=WAGGLE_MEMORY_POLICY),
                     SystemMessage(content=instruction.render()),
                     HumanMessage(content=user_input),
                 ]
@@ -649,9 +591,6 @@ def run_cli() -> None:
         return
 
     console_print("Chatbot is ready. Type /help for commands, or 'exit' to quit.")
-
-    # Hydrate Waggle memory for this CLI session (best-effort, no-op when off).
-    prime_session("cli")
 
     # Resume any schedules persisted from previous sessions.
     restored = scheduler.resume_persisted()

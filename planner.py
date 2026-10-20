@@ -41,7 +41,7 @@ log = logging.getLogger(__name__)
 # ---- Data ---------------------------------------------------------------------
 
 
-TaskType = Literal["search", "reminder", "calculation", "rag", "chat", "email"]
+TaskType = Literal["search", "reminder", "calculation", "rag", "chat"]
 
 
 class SearchPlan(BaseModel):
@@ -59,8 +59,7 @@ class SearchPlan(BaseModel):
             "(default). 'reminder' has no tool call — the LLM just writes a "
             "short reminder line. 'calculation' calls the calculator tool. "
             "'rag' calls the user's active-document retrieval tool. 'chat' asks the "
-            "LLM directly with no tool nudging. 'email' calls Gmail tools for "
-            "inbox reads or mailbox writes."
+            "LLM directly with no tool nudging."
         ),
     )
     search_query: str = Field(
@@ -452,11 +451,6 @@ _CHAT_RE = re.compile(
     r"give\s+me\s+a\s+(?:joke|poem)|make\s+up|imagine|pretend)\b",
     re.IGNORECASE,
 )
-_EMAIL_RE = re.compile(
-    r"\b(?:email|e-?mail|inbox|mailbox|unread|read\s+mail|check\s+mail|"
-    r"send\s+(?:an?\s+)?mail|compose|draft|gmail)\b",
-    re.IGNORECASE,
-)
 
 
 def _detect_task_type(prompt: str, cleaned_query: str) -> tuple[TaskType, Optional[str]]:
@@ -484,9 +478,6 @@ def _detect_task_type(prompt: str, cleaned_query: str) -> tuple[TaskType, Option
 
     if _CHAT_RE.search(prompt):
         return "chat", None
-
-    if _EMAIL_RE.search(prompt):
-        return "email", None
 
     return "search", None
 
@@ -649,7 +640,7 @@ def _clamp_plan(plan: SearchPlan) -> SearchPlan:
 
     # Validate task_type; unknown values collapse to 'search'.
     task_type: TaskType = plan.task_type if plan.task_type in (
-        "search", "reminder", "calculation", "rag", "chat", "email"
+        "search", "reminder", "calculation", "rag", "chat"
     ) else "search"
     reminder_text = plan.reminder_text if task_type == "reminder" else None
 
@@ -751,19 +742,8 @@ class SearchExecutionInstruction:
             "Remove citation markers like [1], [2], [j], [k], etc. "
             "If the user asks a simple factual question (e.g. capital, population, "
             "president), give a direct answer in 1 sentence, not an essay. "
-            "If the user's request is about their own email/inbox, skip web search "
-            "and use the Gmail tools instead: list_messages/get_message to fetch "
-            "messages, modify_message for read/unread or labels, create_draft for "
-            "writing, send_message to send, trash_message/delete_message to remove. "
-            "Present email answers in plain, human-readable prose — one line per "
-            "message (sender, subject, short snippet, relative time), or sender, "
-            "time and the message body when detailing a single message. Message "
-            "IDs, thread IDs, label IDs and raw JSON are internal bookkeeping "
-            "only: never display them, and use them silently when the user asks "
-            "you to act on an email. Do not emit JSON code blocks unless the "
-            "user explicitly asks for technical details. Before sending an email "
-            "or permanently deleting a message, confirm explicitly with the user "
-            "first."
+            "Do not emit JSON code blocks unless the user explicitly asks for "
+            "technical details."
         )
 
 
@@ -822,24 +802,3 @@ class ChatExecutionInstruction:
             f"Fulfil the user's request: {self.prompt_summary!r}. Be concise."
         )
 
-
-@dataclass
-class EmailExecutionInstruction:
-    """Instructs the LLM to use Gmail tools for email operations."""
-
-    prompt_summary: str
-
-    def render(self) -> str:
-        return (
-            "This task involves the user's email. Use the Gmail tools to help: "
-            "list_messages to search/fetch messages, get_message to read a "
-            "specific message, modify_message for read/unread or labels, "
-            "create_draft for writing, send_message to send, trash_message/"
-            "delete_message to remove. Present email answers in plain, "
-            "human-readable prose — one line per message (sender, subject, "
-            "short snippet, relative time). Message IDs, thread IDs, label "
-            "IDs and raw JSON are internal bookkeeping only: never display "
-            "them. Before sending an email or permanently deleting a message, "
-            "confirm explicitly with the user first. "
-            f"Fulfil the user's request: {self.prompt_summary!r}."
-        )

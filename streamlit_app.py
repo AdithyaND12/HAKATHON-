@@ -58,13 +58,10 @@ except ImportError:  # pragma: no cover - only hit when the optional dep is miss
 # Reuse everything the CLI used.
 import config
 import ragtool
-import gmail_client
 from app import _registry, chatbot, llm, scheduler, set_chatbot_model
-from waggle_tools import WAGGLE_MEMORY_POLICY, memorize_turn, prime_session
 from planner import (
     CalculationExecutionInstruction,
     ChatExecutionInstruction,
-    EmailExecutionInstruction,
     RagExecutionInstruction,
     ReminderExecutionInstruction,
     SearchExecutionInstruction,
@@ -574,7 +571,6 @@ def _create_conversation(conversations: dict) -> str:
     """Add a fresh empty conversation and return its id."""
     conv_id = str(uuid.uuid4())[:8]
     conversations[conv_id] = {"title": "new chat", "messages": []}
-    prime_session(conv_id)
     return conv_id
 
 
@@ -819,8 +815,6 @@ def _build_llm_messages(prompt: str, plan: SearchPlan, history: list[dict]) -> l
     (RAG source label or raw document, plus the planner's search instruction),
     the trimmed prior conversation, then the user's current prompt."""
     system_messages: list[SystemMessage] = []
-    if config.WAGGLE_MCP_ENABLED:
-        system_messages.append(SystemMessage(content=WAGGLE_MEMORY_POLICY))
     if st.session_state.get("rag_mode", True):
         # RAG on: tell the LLM which uploaded document the RAG tool can see so
         # it reaches for get_rag_chunks when the question targets that PDF.
@@ -849,8 +843,6 @@ def _build_llm_messages(prompt: str, plan: SearchPlan, history: list[dict]) -> l
         instruction = RagExecutionInstruction(plan.search_query)
     elif plan.task_type == "chat":
         instruction = ChatExecutionInstruction(plan.search_query)
-    elif plan.task_type == "email":
-        instruction = EmailExecutionInstruction(plan.search_query)
     else:
         instruction = SearchExecutionInstruction(plan.search_query)
     system_messages.append(SystemMessage(content=instruction.render()))
@@ -1236,62 +1228,6 @@ with st.sidebar:
             st.rerun()
 
     st.divider()
-
-    # ---- Gmail: per-user OAuth connection -----------------------------------
-    st.markdown("### gmail")
-
-    # Handle OAuth callback: Google redirects with ?code=...&state=...
-    _oauth_code = st.query_params.get("code")
-    _oauth_state = st.query_params.get("state")
-    if _oauth_code and _oauth_state:
-        expected_state = st.session_state.get("gmail_session_id")
-        if (
-            _oauth_state != expected_state
-            or not gmail_client.consume_oauth_state(_oauth_state)
-        ):
-            st.error("Gmail auth failed: invalid or expired OAuth state.")
-        else:
-            try:
-                gmail_client.exchange_code(_oauth_code, _oauth_state)
-                st.session_state["gmail_session_id"] = _oauth_state
-                st.toast("Gmail connected!")
-            except Exception as exc:
-                st.error(f"Gmail auth failed: {exc}")
-        st.query_params.clear()
-
-    gmail_session_id = st.session_state.get("gmail_session_id", "")
-    gmail_connected = gmail_client.is_connected(gmail_session_id) if gmail_session_id else False
-
-    if gmail_connected:
-        try:
-            _profile = gmail_client.get_profile(gmail_session_id)
-            _email = _profile.get("emailAddress", "connected")
-        except Exception:
-            _email = "connected"
-        st.caption(f"active: **{_email}**")
-        if st.button("disconnect gmail", use_container_width=True):
-            gmail_client.delete_tokens(gmail_session_id)
-            st.session_state.pop("gmail_session_id", None)
-            st.rerun()
-    else:
-        # Generate a session_id and build the Google consent URL
-        import uuid as _uuid
-        if not gmail_session_id:
-            gmail_session_id = _uuid.uuid4().hex[:12]
-            st.session_state["gmail_session_id"] = gmail_session_id
-        try:
-            _auth_url = gmail_client.get_auth_url(gmail_session_id)
-            st.markdown(
-                f'<a href="{_auth_url}" target="_blank" '
-                f'style="text-decoration:none;color:#7ee787;font-family:monospace;font-size:0.8rem;">'
-                f'connect gmail</a>',
-                unsafe_allow_html=True,
-            )
-            st.caption("opens Google's official consent screen")
-        except RuntimeError as exc:
-            st.warning(str(exc))
-
-    st.divider()
     _active_chat_for_export = st.session_state.conversations[st.session_state.active_conv]
     st.download_button(
         "export chat (.md)",
@@ -1508,15 +1444,6 @@ if prompt:
             if not reply:
                 reply = "_(no response — the model returned nothing; details logged)_"
             placeholder.markdown(reply)
-            # Store the turn into Waggle memory (best-effort, no-op when off).
-            # Skip error banners and empty placeholder replies.
-            if reply and not reply.startswith("⚠️"):
-                memorize_turn(
-                    prompt,
-                    reply,
-                    session_id=st.session_state.active_conv,
-                    block=False,
-                )
             if usage:
                 st.caption(
                     " · ".join(

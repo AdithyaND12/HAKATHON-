@@ -262,20 +262,6 @@ def test_document_endpoints_list_and_set_active(monkeypatch):
 # ---- Regression tests for input validation -----------------------------------
 
 
-def test_gmail_endpoints_reject_path_traversal_session_ids():
-    response = client.get("/gmail/status", params={"session_id": "../conversations"})
-    assert response.status_code == 400
-
-    response = client.post("/gmail/disconnect", params={"session_id": "../conversations"})
-    assert response.status_code == 400
-
-
-def test_gmail_callback_rejects_unissued_state():
-    response = client.get("/gmail/callback", params={"code": "x", "state": "../conversations"})
-    assert response.status_code == 400
-    assert "OAuth state" in response.json()["detail"]
-
-
 def test_upload_rejects_non_pdf_extension():
     response = client.post(
         "/documents/upload",

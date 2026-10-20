@@ -49,13 +49,6 @@ The scheduling engine was rewritten to fix the pain points of the original:
   titles, and conversation export (`.md` / `.json`) in the UI.
 - Live run polling via a background `@st.fragment` in the UI — no full-page
   auto-refresh needed (`streamlit-autorefresh` is now optional).
-- Optional Gmail integration through the gmail-mcp MCP server — the chatbot
-  can read/search the inbox (`list_messages`, `get_message`, `get_profile`)
-  and manage the mailbox (send, drafts, labels, trash/delete, threads, batch
-  ops) when `GMAIL_MCP_ENABLED=true`. Account settings (vacation, IMAP/POP,
-  filters, forwarding, send-as, delegates, S/MIME) are deliberately excluded.
-  The agent is instructed to confirm with you before sending or permanently
-  deleting messages.
 
 ## Requirements
 
@@ -106,10 +99,6 @@ cp .env.example .env
 | `DUCKDUCKGO_REGION` | No | `us-en` | DuckDuckGo region parameter. |
 | `SEARCH_MAX_RETRIES` | No | `3` | Retries for a single web_search invocation. |
 | `SEARCH_RETRY_BACKOFF_SECONDS` | No | `2.0` | Base backoff (doubles each retry). |
-| `GMAIL_MCP_ENABLED` | No | `false` | Set `true` to expose Gmail inbox + mailbox-write tools. |
-| `GMAIL_MCP_COMMAND` | No | `node` | Executable that runs the gmail-mcp server. |
-| `GMAIL_MCP_ARGS` | No | `/Users/adithya/agent2/gmail-mcp/dist/index.js` | Args (path) passed to the MCP command. |
-| `GMAIL_MCP_PORT` | No | `0` | HTTP listen port for the MCP's standalone listener; `0` = OS-assigned (avoids clashes). |
 
 The local `.env` file is ignored by Git. Never commit real API keys.
 
@@ -282,7 +271,6 @@ persistence, resume, pause, cancel, no-wait-after-final-run).
 streamlit_app.py      Primary UI — dark terminal-inspired chat (Streamlit)
 app.py                Legacy CLI + LangGraph wiring + tools (imported by streamlit_app)
 config.py             Centralised env parsing
-gmail_tools.py        Optional Gmail tools (gmail-mcp: reads + mailbox writes)
 planner.py            Search + schedule planner (LLM + regex fallback + absolute time)
 scheduler.py          Job registry, persistence, retries, pause/resume
 tools_search.py       DuckDuckGo tool with retry / backoff
@@ -295,41 +283,6 @@ chroma_stores/       Vector stores (one dir per embedding model) — git-ignored
 
 ## Troubleshooting
 
-- **Planner classification**: set `GMAIL_MCP_ENABLED=true`. The chatbot starts
-  the gmail-mcp server (`node dist/index.js`) as a stdio subprocess and binds a
-  curated subset of its tools: inbox reads plus mailbox writes (send, drafts,
-  labels, trash/delete, threads, watch). Account settings are never exposed.
-  OAuth credentials are read from the server's default config dir
-  (`~/.gmail-mcp/`); run `npx -y @shinzolabs/gmail-mcp auth` once to authorize.
-  If auth, Node, or the server are unavailable, the app logs a warning and
-  continues without email tools. The agent is prompted to confirm before
-  sending or permanently deleting messages — but treat `send_message` /
-  `delete_message` as real actions, because they are.
-- **Gmail on Streamlit Cloud**: the container has no `~/.gmail-mcp/` and no
-  cloned server, so two extra steps are needed. (1) Node is installed via
-  `packages.txt`, and gmail-mcp runs from npm (`npx @shinzolabs/gmail-mcp`) —
-  this happens automatically when the local build path doesn't exist. (2) Put
-  your OAuth material in the app's Secrets so it can be authorized without an
-  interactive browser flow on the cloud machine:
-  run `npx -y @shinzolabs/gmail-mcp auth` **locally** once, then copy the two
-  generated files into Streamlit Cloud → App settings → Secrets:
-
-  ```toml
-  GMAIL_MCP_ENABLED = "true"
-
-  [gmail_oauth_keys]
-  # full contents of ~/.gmail-mcp/gcp-oauth.keys.json
-  installed = { client_id = "...", client_secret = "...", ... }
-
-  [gmail_credentials]
-  # full contents of ~/.gmail-mcp/credentials.json
-  access_token = "..."
-  refresh_token = "..."
-  ```
-
-  At startup the app writes these to `~/.gmail-mcp/` before spawning the MCP
-  server. If the cached token expires, re-run the local auth and update the
-  secrets.
 - **Gemini authentication error**: confirm `GEMINI_API_KEY` is set correctly in
   your `.env`.
 - **Embedding API error (RAG)**: confirm `JINA_API_KEY` is set correctly in your
