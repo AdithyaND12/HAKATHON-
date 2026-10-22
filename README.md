@@ -92,6 +92,9 @@ cp .env.example .env
 | `LLM_CLIENT_MAX_RETRIES` | No | `2` | SDK retries per LLM request. |
 | `JINA_API_KEY` | For RAG | — | Jina Embeddings API key (free tier: https://jina.ai/embeddings/). |
 | `JINA_EMBEDDING_MODEL` | No | `jina-embeddings-v4` | Free embedding model used for all RAG indexing + search. |
+| `JINA_RERANK_MODEL` | No | `jina-reranker-v3.5` | Cross-encoder reranker (uses the same `JINA_API_KEY`). |
+| `RERANK_ENABLED` | No | `true` | Enable reranking after hybrid retrieval. |
+| `RERANK_TIMEOUT_SECONDS` | No | `20` | Timeout for the rerank request; failures keep fusion order. |
 | `JINA_EMBEDDING_BATCH_SIZE` | No | `100` | Chunks per embedding request (one POST per batch). |
 | `ALPHAVANTAGE_API_KEY` | For stocks | — | Alpha Vantage API key. |
 | `HTTP_TIMEOUT_SECONDS` | No | `10` | Timeout for stock API requests. |
@@ -227,8 +230,14 @@ embedding model defaults to `jina-embeddings-v4` (free tier: 1M tokens/day).
 - **Contextual retrieval** — chunks are embedded with a `[document > section]`
   prefix so semantically related passages that share no words still co-locate;
   the raw passage is kept in metadata so answers quote clean, readable text.
-- **MMR retrieval** — Maximal Marginal Relevance fetches `5 × k` candidates
-  and returns a *diverse* top-k instead of several near-duplicate hits.
+- **Hybrid retrieval** — the vector arm (MMR over `5 × k` candidates) is fused
+  with a BM25 keyword index over the same chunks via Reciprocal Rank Fusion,
+  so exact names, numbers, and section terms are not lost to embedding drift.
+  BM25 data is stored in a `.bm25_<collection>.json` sidecar; older indexes
+  rebuild it from stored metadata on first query.
+- **Cross-encoder reranking** — the fused candidates are reordered by Jina's
+  reranker (`jina-reranker-v3.5`, same `JINA_API_KEY`) before returning top-k.
+  Missing key, disabled setting, or an API error silently keeps fusion order.
 
 ### Robustness and freshness
 

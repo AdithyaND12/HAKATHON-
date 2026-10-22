@@ -148,6 +148,11 @@ def test_index_pdf_builds_collection_and_writes_sidecar(monkeypatch, tmp_path):
     assert meta["chunks"] == 1
     assert meta["embedding_model"] == ragtool.JINA_EMBEDDING_MODEL
     assert (tmp_path / f".marker_{collection}").read_text(encoding="utf-8") == ragtool._expected_marker(sha)
+    bm25 = json.loads(
+        (tmp_path / f".bm25_{collection}.json").read_text(encoding="utf-8")
+    )
+    assert bm25["version"] == ragtool.BM25_SIDECAR_VERSION
+    assert bm25["entries"][0]["raw_text"] == "hello document text"
 
 
 def test_index_pdf_skips_reindexing_when_unchanged(monkeypatch, tmp_path):
@@ -224,7 +229,7 @@ def test_index_pdf_rejects_empty_pdf(monkeypatch, tmp_path):
         ragtool.index_pdf(pdf)
 
 
-def test_retrieve_active_chunks_queries_uploaded_collection(monkeypatch):
+def test_retrieve_active_chunks_queries_uploaded_collection(monkeypatch, tmp_path):
     seen = []
 
     class _Store:
@@ -236,6 +241,8 @@ def test_retrieve_active_chunks_queries_uploaded_collection(monkeypatch):
 
     monkeypatch.setattr(ragtool, "_get_vectorstore", _Store)
     monkeypatch.setattr(ragtool.time, "sleep", lambda seconds: None)
+    monkeypatch.setattr(ragtool, "PERSIST_DIRECTORY", tmp_path)
+    monkeypatch.setattr(ragtool, "RERANK_ENABLED", False)
 
     uploaded = ragtool.collection_name_for_sha("f" * 64)
     ragtool.set_active_collection(uploaded)
@@ -391,7 +398,7 @@ def test_format_results_falls_back_to_embedded_text():
     assert "plain stored text" in out
 
 
-def test_retrieve_once_uses_mmr_for_diversity(monkeypatch):
+def test_retrieve_once_uses_mmr_for_diversity(monkeypatch, tmp_path):
     class _MmrStore:
         def __init__(self, collection_name):
             self.calls = []
@@ -402,10 +409,12 @@ def test_retrieve_once_uses_mmr_for_diversity(monkeypatch):
 
     store = _MmrStore("x")
     monkeypatch.setattr(ragtool, "_get_vectorstore", lambda collection_name: store)
+    monkeypatch.setattr(ragtool, "PERSIST_DIRECTORY", tmp_path)
+    monkeypatch.setattr(ragtool, "RERANK_ENABLED", False)
 
     out = ragtool._retrieve_once("speech", "rag_abc", 4)
 
-    assert store.calls == [("speech", 4, 20)]
+    assert store.calls == [("speech", 20, 40)]
     assert "chunk a" in out
 
 
@@ -504,3 +513,139 @@ def test_selecting_raw_document_clears_indexed(monkeypatch, tmp_path):
     ragtool.set_active_raw("raw_fresh")
 
     assert ragtool._ACTIVE_COLLECTION is None
+
+
+# ---- Hybrid retrieval: BM25 + RRF + reranker ---------------------------------
+
+
+def test_bm25_prefers_exact_keyword_matches():
+    entries = [
+        {"raw_text": "the cat sat on the mat"},
+        {"raw_text": "article 21 protects life and personal liberty"},
+        {"raw_text": "random text about the weather"},
+    ]
+
+    hits = ragtool._BM25Index(entries).search("article 21", limit=3)
+
+    assert hits and hits[0] == 1
+
+
+def test_rrf_rewards_agreement_between_arms():
+    fused = ragtool._reciprocal_rank_fusion(
+        [["a", "b", "c"], ["c", "a"]], limit=2
+    )
+
+    assert fused == ["a", "c"]
+
+
+def test_hybrid_retrieval_adds_bm25_only_hits(monkeypatch, tmp_path):
+    class _Store:
+        def max_marginal_relevance_search(self, query, k=4, fetch_k=20):
+            return [Document(page_content="unrelated chunk", metadata={"page": 0})]
+
+    monkeypatch.setattr(ragtool, "_get_vectorstore", lambda name: _Store())
+    monkeypatch.setattr(ragtool, "PERSIST_DIRECTORY", tmp_path)
+    monkeypatch.setattr(ragtool, "RERANK_ENABLED", False)
+    ragtool._write_bm25_sidecar(
+        "rag_kw",
+        [
+            Document(
+                page_content="Article 21 protects personal liberty",
+                metadata={"page": 4},
+            )
+        ],
+    )
+
+    out = ragtool._retrieve_once("article 21", "rag_kw", 2)
+
+    assert "Article 21 protects personal liberty" in out
+
+
+def test_bm25_rebuilds_from_vector_store_without_sidecar(monkeypatch, tmp_path):
+    class _Collection:
+        def get(self, include=None):
+            return {
+                "documents": ["Article 21 protects liberty", "unrelated text"],
+                "metadatas": [{"page": 4}, {"page": 5}],
+            }
+
+    class _Store:
+        def __init__(self):
+            self._collection = _Collection()
+
+        def max_marginal_relevance_search(self, query, k=4, fetch_k=20):
+            return [Document(page_content="unrelated text", metadata={"page": 5})]
+
+    monkeypatch.setattr(ragtool, "_get_vectorstore", lambda name: _Store())
+    monkeypatch.setattr(ragtool, "PERSIST_DIRECTORY", tmp_path)
+    monkeypatch.setattr(ragtool, "RERANK_ENABLED", False)
+
+    out = ragtool._retrieve_once("article 21 liberty", "rag_nosidecar", 2)
+
+    assert "Article 21 protects liberty" in out
+
+
+class _FakeRerankResponse:
+    def __init__(self, payload):
+        self._payload = payload
+
+    def raise_for_status(self):
+        return None
+
+    def json(self):
+        return self._payload
+
+
+def test_rerank_documents_orders_by_api_score(monkeypatch):
+    seen = {}
+
+    def fake_post(url, headers=None, json=None, timeout=None):
+        seen["url"] = url
+        seen["payload"] = json
+        return _FakeRerankResponse(
+            {
+                "results": [
+                    {"index": 1, "relevance_score": 0.9},
+                    {"index": 0, "relevance_score": 0.1},
+                ]
+            }
+        )
+
+    monkeypatch.setattr(ragtool.requests, "post", fake_post)
+    monkeypatch.setattr(ragtool, "JINA_API_KEY", "jina-test")
+    monkeypatch.setattr(ragtool, "RERANK_ENABLED", True)
+
+    documents = [Document(page_content="alpha"), Document(page_content="beta")]
+    out = ragtool._rerank_documents("question", documents, 2)
+
+    assert [doc.page_content for doc in out] == ["beta", "alpha"]
+    assert seen["url"] == "https://api.jina.ai/v1/rerank"
+    assert seen["payload"]["model"] == ragtool.JINA_RERANK_MODEL
+
+
+def test_rerank_skips_without_api_key(monkeypatch):
+    def boom(*args, **kwargs):
+        raise AssertionError("rerank API must not be called without a key")
+
+    monkeypatch.setattr(ragtool.requests, "post", boom)
+    monkeypatch.setattr(ragtool, "JINA_API_KEY", "")
+    monkeypatch.setattr(ragtool, "RERANK_ENABLED", True)
+
+    documents = [Document(page_content="alpha"), Document(page_content="beta")]
+    out = ragtool._rerank_documents("question", documents, 2)
+
+    assert [doc.page_content for doc in out] == ["alpha", "beta"]
+
+
+def test_rerank_falls_back_on_api_error(monkeypatch):
+    def fail(*args, **kwargs):
+        raise ragtool.requests.RequestException("service unavailable")
+
+    monkeypatch.setattr(ragtool.requests, "post", fail)
+    monkeypatch.setattr(ragtool, "JINA_API_KEY", "jina-test")
+    monkeypatch.setattr(ragtool, "RERANK_ENABLED", True)
+
+    documents = [Document(page_content="alpha"), Document(page_content="beta")]
+    out = ragtool._rerank_documents("question", documents, 2)
+
+    assert [doc.page_content for doc in out] == ["alpha", "beta"]
