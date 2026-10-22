@@ -57,6 +57,18 @@ except ImportError:  # pragma: no cover - only hit when the optional dep is miss
 
 # Reuse everything the CLI used.
 import config
+
+# Fail with an actionable message instead of a raw pydantic ValidationError:
+# importing `app` below builds the Gemini client, which requires the key.
+if not config.GEMINI_API_KEY:
+    st.error(
+        "**GEMINI_API_KEY is not set.** Open *App settings → Secrets* and add "
+        'it as a root-level entry (not inside a `[section]`):\n\n'
+        '```toml\nGEMINI_API_KEY = "your-google-ai-studio-key"\n```\n\n'
+        "Then save to reboot the app."
+    )
+    st.stop()
+
 import ragtool
 from app import _registry, chatbot, llm, scheduler, set_chatbot_model
 from planner import (
