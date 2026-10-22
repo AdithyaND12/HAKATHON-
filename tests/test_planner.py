@@ -77,16 +77,21 @@ def test_clamp_zero_out_wait_when_no_schedule():
     assert clamped.run_count == 1
 
 
-def test_cheap_prompt_skips_llm(monkeypatch):
+def test_trivial_prompt_still_uses_planner_llm(monkeypatch):
     called = {"n": 0}
 
     def fake_invoke(messages):
         called["n"] += 1
-        raise AssertionError("planner LLM should not be called for cheap prompts")
+        return planner.SearchPlan(
+            search_query="2 + 2",
+            should_schedule=False,
+            wait_minutes=0,
+            run_count=1,
+        )
 
     monkeypatch.setattr(planner, "_invoke_search_planner", fake_invoke)
     plan = planner.create_search_plan("2 + 2")
-    assert called["n"] == 0
+    assert called["n"] == 1
     assert plan.run_count == 1
     assert not plan.should_schedule
 
@@ -248,47 +253,6 @@ def test_literal_hourly_interval_overrides_llm(monkeypatch):
 
     assert plan.wait_minutes == 60.0
     assert plan.should_schedule is True
-
-
-# ---- Fast-path planning (no planner LLM round trip) --------------------------
-
-
-def test_small_talk_skips_llm(monkeypatch):
-    def boom(messages):
-        raise AssertionError("planner LLM should not run for small talk")
-
-    monkeypatch.setattr(planner, "_invoke_search_planner", boom)
-    plan = planner.create_search_plan("hello!")
-    assert plan.task_type == "chat"
-    assert not plan.should_schedule
-
-
-def test_document_question_skips_llm_and_routes_to_rag(monkeypatch):
-    def boom(messages):
-        raise AssertionError("planner LLM should not run for document questions")
-
-    monkeypatch.setattr(planner, "_invoke_search_planner", boom)
-    plan = planner.create_search_plan("summarize my uploaded pdf")
-    assert plan.task_type == "rag"
-    assert not plan.should_schedule
-
-
-def test_web_lookup_still_uses_planner_llm(monkeypatch):
-    called = {"n": 0}
-
-    def fake_invoke(messages):
-        called["n"] += 1
-        return planner.SearchPlan(
-            search_query="latest python news",
-            should_schedule=False,
-            wait_minutes=0,
-            run_count=1,
-        )
-
-    monkeypatch.setattr(planner, "_invoke_search_planner", fake_invoke)
-    plan = planner.create_search_plan("what is the latest python news?")
-    assert called["n"] == 1
-    assert plan.task_type == "search"
 
 
 def test_chat_llm_uses_dedicated_timeout_and_retries():
