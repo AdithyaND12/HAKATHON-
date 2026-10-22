@@ -34,6 +34,11 @@ GEMINI_MODEL_OPTIONS = {
     "Gemma 4 26B MoE IT": "gemma-4-26b-a4b-it",
 }
 DEFAULT_HTTP_TIMEOUT_SECONDS = 10.0
+# LLM calls need a much longer timeout than the stock API: Gemini routinely
+# takes longer than 10s under load, and a short timeout triggers the SDK's
+# retry loop (default 6 attempts), which multiplies every stall.
+DEFAULT_LLM_TIMEOUT_SECONDS = 60.0
+DEFAULT_LLM_CLIENT_MAX_RETRIES = 2
 DEFAULT_WAIT_MAX_SECONDS = 3600.0
 DEFAULT_MAX_AUTO_RUNS = 20
 DEFAULT_DATA_DIR = Path(__file__).resolve().parent / ".hakathon"
@@ -129,6 +134,10 @@ ALPHAVANTAGE_API_KEY = env_str("ALPHAVANTAGE_API_KEY") or streamlit_secret(
     "ALPHAVANTAGE_API_KEY"
 )
 HTTP_TIMEOUT_SECONDS = env_float("HTTP_TIMEOUT_SECONDS", DEFAULT_HTTP_TIMEOUT_SECONDS)
+LLM_TIMEOUT_SECONDS = env_float("LLM_TIMEOUT_SECONDS", DEFAULT_LLM_TIMEOUT_SECONDS)
+LLM_CLIENT_MAX_RETRIES = env_int(
+    "LLM_CLIENT_MAX_RETRIES", DEFAULT_LLM_CLIENT_MAX_RETRIES
+)
 WAIT_MAX_SECONDS = env_float("WAIT_MAX_SECONDS", DEFAULT_WAIT_MAX_SECONDS)
 # Recurrence intervals are not bounded by the wait tool's limit: "every 6
 # hours" or "daily" are valid schedules. Cap at one week to stay bounded.
