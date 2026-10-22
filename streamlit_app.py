@@ -36,6 +36,7 @@ import logging
 import os
 import re
 import threading
+import time
 import uuid
 from datetime import datetime
 from pathlib import Path
@@ -93,6 +94,11 @@ log = logging.getLogger(__name__)
 # message count and total characters so long chats can't blow the context window.
 HISTORY_MAX_MESSAGES = 20
 HISTORY_MAX_CHARS = 24_000
+
+# Re-render the streaming placeholder at most every N seconds: rendering the
+# whole accumulated markdown on every token is O(n^2) work and makes long
+# answers lag noticeably on slow (free-tier) hosts.
+STREAM_RENDER_INTERVAL_SECONDS = 0.05
 
 
 # ---- Page config -------------------------------------------------------------
@@ -1441,11 +1447,15 @@ if prompt:
             placeholder = st.empty()
             chunks: list[str] = []
             usage: dict | None = None
+            last_render = 0.0
             try:
                 for text_chunk, chunk_usage in _stream_chatbot(prompt, plan, history_before):
                     if text_chunk:
                         chunks.append(text_chunk)
-                        placeholder.markdown("".join(chunks))
+                        now = time.monotonic()
+                        if now - last_render >= STREAM_RENDER_INTERVAL_SECONDS:
+                            placeholder.markdown("".join(chunks))
+                            last_render = now
                     if chunk_usage:
                         usage = chunk_usage
             except Exception as exc:  # noqa: BLE001

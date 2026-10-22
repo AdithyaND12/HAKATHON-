@@ -198,6 +198,13 @@ _CHEAP_TIME_RE = re.compile(
     r"^\s*(?:what(?:'s|s|\s+is)?\s+the\s+)?(?:current\s+)?time\s*[?]?\s*$",
     re.IGNORECASE,
 )
+# Exact-match small talk: clearly conversational, so no planner LLM needed.
+_SMALL_TALK_RE = re.compile(
+    r"^\s*(?:hi|hello|hey|yo|sup|thanks|thank\s+you|thx|ok(?:ay)?|cool|nice|"
+    r"good\s+(?:morning|afternoon|evening)|bye|goodbye|who\s+are\s+you|"
+    r"what\s+can\s+you\s+do|help|how\s+are\s+you)[\s!.,?]*$",
+    re.IGNORECASE,
+)
 
 
 def _parse_number_token(value: str) -> float:
@@ -446,6 +453,14 @@ _RAG_RE = re.compile(
     r"directive\s+principles?|preamble)\b",
     re.IGNORECASE,
 )
+# User-uploaded documents (RAG) — referenced without naming the Constitution.
+_DOC_RE = re.compile(
+    r"\b(?:pdf|uploaded\s+(?:pdf|file|document|doc|paper)|"
+    r"my\s+(?:pdf|document|doc|paper)|"
+    r"the\s+(?:pdf|document|doc|paper)|"
+    r"this\s+(?:pdf|document|doc|paper))\b",
+    re.IGNORECASE,
+)
 _CHAT_RE = re.compile(
     r"\b(?:tell\s+me\s+a\s+joke|write\s+(?:a|me)\s+(?:poem|haiku|story|song)|"
     r"give\s+me\s+a\s+(?:joke|poem)|make\s+up|imagine|pretend)\b",
@@ -473,7 +488,7 @@ def _detect_task_type(prompt: str, cleaned_query: str) -> tuple[TaskType, Option
     if _CALCULATION_RE.search(prompt):
         return "calculation", None
 
-    if _RAG_RE.search(prompt):
+    if _RAG_RE.search(prompt) or _DOC_RE.search(prompt):
         return "rag", None
 
     if _CHAT_RE.search(prompt):
@@ -485,20 +500,28 @@ def _detect_task_type(prompt: str, cleaned_query: str) -> tuple[TaskType, Option
 # ---- LLM planner --------------------------------------------------------------
 
 
-def build_chat_llm(model: Optional[str] = None) -> ChatGoogleGenerativeAI:
+def build_chat_llm(
+    model: Optional[str] = None, *, max_output_tokens: Optional[int] = None
+) -> ChatGoogleGenerativeAI:
     """Build a chat LLM client with the configured API key and request timeout.
 
     This is the single construction point for the chat model so every caller
-    (chat + planner) shares the same settings.
+    (chat + planner) shares the same settings. `max_output_tokens` lets the
+    planner cap its (tiny) structured JSON so slow models can't ramble.
     """
+    kwargs = {"max_output_tokens": max_output_tokens} if max_output_tokens else {}
     return ChatGoogleGenerativeAI(
         model=model or config.GEMINI_MODEL,
         google_api_key=config.GEMINI_API_KEY,
-        request_timeout=config.HTTP_TIMEOUT_SECONDS,
+        request_timeout=config.LLM_TIMEOUT_SECONDS,
+        max_retries=config.LLM_CLIENT_MAX_RETRIES,
+        **kwargs,
     )
 
 
-_llm = build_chat_llm()
+_PLANNER_MAX_OUTPUT_TOKENS = 512
+
+_llm = build_chat_llm(max_output_tokens=_PLANNER_MAX_OUTPUT_TOKENS)
 
 
 def set_planner_model(model: str) -> None:
@@ -508,7 +531,7 @@ def set_planner_model(model: str) -> None:
     planner and the chat model always agree on which model is active.
     """
     global _llm, search_planner, _current_planner_method_index
-    _llm = build_chat_llm(model)
+    _llm = build_chat_llm(model, max_output_tokens=_PLANNER_MAX_OUTPUT_TOKENS)
     search_planner = _build_search_planner(_PLANNER_METHODS[0])
     _current_planner_method_index = 0
 
@@ -526,7 +549,7 @@ search_planner = _build_search_planner(_PLANNER_METHODS[0])
 _current_planner_method_index = 0
 
 LLM_MAX_RETRIES = 3
-LLM_RETRY_BACKOFF_SECONDS = 2.0
+LLM_RETRY_BACKOFF_SECONDS = 1.0
 
 _TRANSIENT_API_ERROR_RE = re.compile(
     r"\b(?:429|50[0-9])\b|UNAVAILABLE|RESOURCE_EXHAUSTED|high demand|rate limit",
@@ -590,7 +613,21 @@ def _invoke_search_planner(messages: list) -> SearchPlan:
 
 
 def _is_cheap_prompt(prompt: str) -> bool:
-    return bool(_CHEAP_CALCULATOR_RE.match(prompt) or _CHEAP_TIME_RE.match(prompt))
+    return bool(
+        _CHEAP_CALCULATOR_RE.match(prompt)
+        or _CHEAP_TIME_RE.match(prompt)
+        or _SMALL_TALK_RE.match(prompt)
+    )
+
+
+def _local_only_plan(prompt: str) -> SearchPlan:
+    """Build a plan without an LLM round trip for prompts the regex classifier
+    already routes away from web search (and that ask for no schedule)."""
+    plan = _fallback_search_plan(prompt)
+    if _SMALL_TALK_RE.match(prompt) and plan.task_type == "search":
+        # The regex classifier falls back to "search"; small talk is chat.
+        plan = plan.model_copy(update={"task_type": "chat"})
+    return _clamp_plan(plan)
 
 
 def _normalize_absolute_start(value: object) -> Optional[str]:
@@ -667,8 +704,16 @@ def fallback_search_plan(prompt: str) -> SearchPlan:
 def create_search_plan(prompt: str) -> SearchPlan:
     """Derive the task type and schedule from the user's prompt."""
     if _is_cheap_prompt(prompt):
-        # Skip the LLM for trivial calculator/time queries.
-        return _clamp_plan(_fallback_search_plan(prompt))
+        # Skip the LLM for trivial calculator/time/small-talk queries.
+        return _local_only_plan(prompt)
+
+    # Fast path: when the regex classifier already knows the prompt asks for no
+    # schedule and is not a web lookup (chat/joke, calculation, document RAG,
+    # reminder), skip the planner LLM call entirely — it only added a full
+    # model round trip before every reply.
+    local_plan = _fallback_search_plan(prompt)
+    if not local_plan.should_schedule and local_plan.task_type != "search":
+        return _clamp_plan(local_plan)
 
     try:
         plan = _invoke_search_planner(

@@ -88,6 +88,8 @@ cp .env.example .env
 | --- | --- | --- | --- |
 | `GEMINI_API_KEY` | Yes | — | Google Gemini API key. |
 | `GEMINI_MODEL` | Yes | `gemini-3.5-flash-lite` | Chat model. |
+| `LLM_TIMEOUT_SECONDS` | No | `60` | Timeout for each LLM request (a short timeout makes the SDK retry every stalled call). |
+| `LLM_CLIENT_MAX_RETRIES` | No | `2` | SDK retries per LLM request. |
 | `JINA_API_KEY` | For RAG | — | Jina Embeddings API key (free tier: https://jina.ai/embeddings/). |
 | `JINA_EMBEDDING_MODEL` | No | `jina-embeddings-v4` | Free embedding model used for all RAG indexing + search. |
 | `JINA_EMBEDDING_BATCH_SIZE` | No | `100` | Chunks per embedding request (one POST per batch). |
