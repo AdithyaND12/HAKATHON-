@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import math
 import os
+import sys
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -85,6 +86,24 @@ def env_path(name: str, default: Path) -> Path:
     return path
 
 
+def streamlit_secret(name: str) -> str:
+    """Read a root-level Streamlit secret when running under Streamlit.
+
+    Community Cloud usually exposes root-level secrets as environment
+    variables, but this also covers secrets pasted under a TOML section and
+    local ``.streamlit/secrets.toml`` files.
+    """
+    if "streamlit" not in sys.modules:
+        return ""
+    try:
+        import streamlit as st
+
+        value = st.secrets.get(name, "")
+    except Exception:
+        return ""
+    return value.strip() if isinstance(value, str) and value.strip() else ""
+
+
 # ---- Public config ------------------------------------------------------------
 
 _legacy_lm_studio_model = env_str("LM_STUDIO_MODEL", "")
@@ -94,18 +113,21 @@ _configured_model = env_str("GEMINI_MODEL", _legacy_lm_studio_model or DEFAULT_G
 GEMINI_MODEL = _RETIRED_GEMINI_MODELS.get(_configured_model, _configured_model)
 
 # Embeddings come from Jina's free API; the chat LLM stays Gemini.
-JINA_API_KEY = env_str("JINA_API_KEY")
+JINA_API_KEY = env_str("JINA_API_KEY") or streamlit_secret("JINA_API_KEY")
 JINA_EMBEDDING_MODEL = env_str("JINA_EMBEDDING_MODEL", DEFAULT_JINA_EMBEDDING_MODEL)
-GEMINI_API_KEY = env_str(
-    "GEMINI_API_KEY",
-    env_str("GOOGLE_API_KEY", _legacy_lm_studio_api_key),
+GEMINI_API_KEY = (
+    env_str("GEMINI_API_KEY", env_str("GOOGLE_API_KEY", _legacy_lm_studio_api_key))
+    or streamlit_secret("GEMINI_API_KEY")
+    or streamlit_secret("GOOGLE_API_KEY")
 )
 
 # Backward-compatible aliases for older imports.
 LM_STUDIO_MODEL = GEMINI_MODEL
 LM_STUDIO_API_KEY = GEMINI_API_KEY
 LM_STUDIO_BASE_URL = "Gemini API"
-ALPHAVANTAGE_API_KEY = env_str("ALPHAVANTAGE_API_KEY")
+ALPHAVANTAGE_API_KEY = env_str("ALPHAVANTAGE_API_KEY") or streamlit_secret(
+    "ALPHAVANTAGE_API_KEY"
+)
 HTTP_TIMEOUT_SECONDS = env_float("HTTP_TIMEOUT_SECONDS", DEFAULT_HTTP_TIMEOUT_SECONDS)
 WAIT_MAX_SECONDS = env_float("WAIT_MAX_SECONDS", DEFAULT_WAIT_MAX_SECONDS)
 # Recurrence intervals are not bounded by the wait tool's limit: "every 6
