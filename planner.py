@@ -190,23 +190,6 @@ _SCHEDULE_HINT_RE = re.compile(
     re.IGNORECASE,
 )
 
-# Cheap-prompt heuristics — skip the LLM entirely.
-_CHEAP_CALCULATOR_RE = re.compile(
-    r"^\s*(?:what(?:'s|s|\s+is)?\s+)?[-+*/\d\s().]+\s*[?]?\s*$"
-)
-_CHEAP_TIME_RE = re.compile(
-    r"^\s*(?:what(?:'s|s|\s+is)?\s+the\s+)?(?:current\s+)?time\s*[?]?\s*$",
-    re.IGNORECASE,
-)
-# Exact-match small talk: clearly conversational, so no planner LLM needed.
-_SMALL_TALK_RE = re.compile(
-    r"^\s*(?:hi|hello|hey|yo|sup|thanks|thank\s+you|thx|ok(?:ay)?|cool|nice|"
-    r"good\s+(?:morning|afternoon|evening)|bye|goodbye|who\s+are\s+you|"
-    r"what\s+can\s+you\s+do|help|how\s+are\s+you)[\s!.,?]*$",
-    re.IGNORECASE,
-)
-
-
 def _parse_number_token(value: str) -> float:
     normalized = value.lower()
     if normalized in _NUMBER_WORDS:
@@ -453,14 +436,6 @@ _RAG_RE = re.compile(
     r"directive\s+principles?|preamble)\b",
     re.IGNORECASE,
 )
-# User-uploaded documents (RAG) — referenced without naming the Constitution.
-_DOC_RE = re.compile(
-    r"\b(?:pdf|uploaded\s+(?:pdf|file|document|doc|paper)|"
-    r"my\s+(?:pdf|document|doc|paper)|"
-    r"the\s+(?:pdf|document|doc|paper)|"
-    r"this\s+(?:pdf|document|doc|paper))\b",
-    re.IGNORECASE,
-)
 _CHAT_RE = re.compile(
     r"\b(?:tell\s+me\s+a\s+joke|write\s+(?:a|me)\s+(?:poem|haiku|story|song)|"
     r"give\s+me\s+a\s+(?:joke|poem)|make\s+up|imagine|pretend)\b",
@@ -488,7 +463,7 @@ def _detect_task_type(prompt: str, cleaned_query: str) -> tuple[TaskType, Option
     if _CALCULATION_RE.search(prompt):
         return "calculation", None
 
-    if _RAG_RE.search(prompt) or _DOC_RE.search(prompt):
+    if _RAG_RE.search(prompt):
         return "rag", None
 
     if _CHAT_RE.search(prompt):
@@ -612,24 +587,6 @@ def _invoke_search_planner(messages: list) -> SearchPlan:
     raise last_error
 
 
-def _is_cheap_prompt(prompt: str) -> bool:
-    return bool(
-        _CHEAP_CALCULATOR_RE.match(prompt)
-        or _CHEAP_TIME_RE.match(prompt)
-        or _SMALL_TALK_RE.match(prompt)
-    )
-
-
-def _local_only_plan(prompt: str) -> SearchPlan:
-    """Build a plan without an LLM round trip for prompts the regex classifier
-    already routes away from web search (and that ask for no schedule)."""
-    plan = _fallback_search_plan(prompt)
-    if _SMALL_TALK_RE.match(prompt) and plan.task_type == "search":
-        # The regex classifier falls back to "search"; small talk is chat.
-        plan = plan.model_copy(update={"task_type": "chat"})
-    return _clamp_plan(plan)
-
-
 def _normalize_absolute_start(value: object) -> Optional[str]:
     """Validate an ISO timestamp and normalize it to UTC.
 
@@ -703,18 +660,6 @@ def fallback_search_plan(prompt: str) -> SearchPlan:
 
 def create_search_plan(prompt: str) -> SearchPlan:
     """Derive the task type and schedule from the user's prompt."""
-    if _is_cheap_prompt(prompt):
-        # Skip the LLM for trivial calculator/time/small-talk queries.
-        return _local_only_plan(prompt)
-
-    # Fast path: when the regex classifier already knows the prompt asks for no
-    # schedule and is not a web lookup (chat/joke, calculation, document RAG,
-    # reminder), skip the planner LLM call entirely — it only added a full
-    # model round trip before every reply.
-    local_plan = _fallback_search_plan(prompt)
-    if not local_plan.should_schedule and local_plan.task_type != "search":
-        return _clamp_plan(local_plan)
-
     try:
         plan = _invoke_search_planner(
             [
