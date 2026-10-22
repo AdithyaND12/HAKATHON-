@@ -1157,6 +1157,12 @@ with st.sidebar:
 
     if st.session_state.get("rag_mode", True):
         st.caption(f"embedding model: `{ragtool.get_embedding_model_name()}`")
+        rerank_label = (
+            f"`{ragtool.JINA_RERANK_MODEL}`"
+            if ragtool.RERANK_ENABLED and ragtool.JINA_API_KEY
+            else "off (add JINA_API_KEY)"
+        )
+        st.caption(f"retrieval: BM25 + vector · rerank: {rerank_label}")
     else:
         st.caption("embedding: off (raw mode)")
     active = _registry.active()

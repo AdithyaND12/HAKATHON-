@@ -34,6 +34,8 @@ GEMINI_MODEL_OPTIONS = {
     "Gemma 4 26B MoE IT": "gemma-4-26b-a4b-it",
 }
 DEFAULT_HTTP_TIMEOUT_SECONDS = 10.0
+DEFAULT_JINA_RERANK_MODEL = "jina-reranker-v3.5"
+DEFAULT_RERANK_TIMEOUT_SECONDS = 20.0
 # LLM calls need a much longer timeout than the stock API: Gemini routinely
 # takes longer than 10s under load, and a short timeout triggers the SDK's
 # retry loop (default 6 attempts), which multiplies every stall.
@@ -81,6 +83,13 @@ def env_int(name: str, default: int) -> int:
     return value
 
 
+def env_bool(name: str, default: bool) -> bool:
+    raw = os.getenv(name)
+    if raw is None or not raw.strip():
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
 def env_path(name: str, default: Path) -> Path:
     raw = env_str(name, "")
     if not raw:
@@ -120,6 +129,10 @@ GEMINI_MODEL = _RETIRED_GEMINI_MODELS.get(_configured_model, _configured_model)
 # Embeddings come from Jina's free API; the chat LLM stays Gemini.
 JINA_API_KEY = env_str("JINA_API_KEY") or streamlit_secret("JINA_API_KEY")
 JINA_EMBEDDING_MODEL = env_str("JINA_EMBEDDING_MODEL", DEFAULT_JINA_EMBEDDING_MODEL)
+# Reranking uses the same Jina key as embeddings (api.jina.ai/v1/rerank).
+JINA_RERANK_MODEL = env_str("JINA_RERANK_MODEL", DEFAULT_JINA_RERANK_MODEL)
+RERANK_ENABLED = env_bool("RERANK_ENABLED", True)
+RERANK_TIMEOUT_SECONDS = env_float("RERANK_TIMEOUT_SECONDS", DEFAULT_RERANK_TIMEOUT_SECONDS)
 GEMINI_API_KEY = (
     env_str("GEMINI_API_KEY", env_str("GOOGLE_API_KEY", _legacy_lm_studio_api_key))
     or streamlit_secret("GEMINI_API_KEY")
