@@ -83,7 +83,10 @@ MAX_AUTO_RUNS = config.MAX_AUTO_RUNS
 
 # ---- LLM ---------------------------------------------------------------------
 
-llm = build_chat_llm()
+# Built lazily when a key is available: the Streamlit UI lets the user paste
+# their own Gemini key at runtime, so importing this module must not require
+# one up front.
+llm = build_chat_llm() if config.GEMINI_API_KEY else None
 
 
 # ---- Tools -------------------------------------------------------------------
@@ -208,8 +211,8 @@ SCHEDULED_RUN_INSTRUCTIONS = (
 
 agent_tools = [get_stock_price, search_tool, calculator, get_rag_chunks, get_time]
 
-llm_with_tools = llm.bind_tools(agent_tools)
-scheduled_llm_with_tools = llm.bind_tools(agent_tools)
+llm_with_tools = llm.bind_tools(agent_tools) if llm is not None else None
+scheduled_llm_with_tools = llm.bind_tools(agent_tools) if llm is not None else None
 
 
 def set_chatbot_model(model: str) -> None:
@@ -223,6 +226,16 @@ def set_chatbot_model(model: str) -> None:
     llm = build_chat_llm(model)
     llm_with_tools = llm.bind_tools(agent_tools)
     scheduled_llm_with_tools = llm.bind_tools(agent_tools)
+
+
+def set_gemini_api_key(api_key: str) -> None:
+    """Apply a user-supplied Gemini key to chat + embeddings at runtime."""
+    global llm, llm_with_tools, scheduled_llm_with_tools
+    config.set_gemini_api_key(api_key)
+    if not config.GEMINI_API_KEY:
+        llm = llm_with_tools = scheduled_llm_with_tools = None
+        return
+    set_chatbot_model(config.GEMINI_MODEL)
 
 
 def _message_text(message: BaseMessage) -> str:
@@ -329,6 +342,11 @@ def chat_node(state: ChatState):
     """LLM node that may answer or request a tool call."""
     messages = _trim_for_invoke(state["messages"])
     selected = scheduled_llm_with_tools if _is_scheduled_run(messages) else llm_with_tools
+    if selected is None:
+        raise RuntimeError(
+            "No Gemini API key is configured. Add your key in the sidebar "
+            "(or set GEMINI_API_KEY / GOOGLE_API_KEY in .env)."
+        )
     return {
         "messages": [
             _invoke_with_transient_retry(lambda: selected.invoke(messages))
@@ -582,10 +600,14 @@ def run_cli() -> None:
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
     if not config.GEMINI_API_KEY:
-        console_print(
-            "GEMINI_API_KEY is not configured. Add it to .env (or export it) and restart."
-        )
-        return
+        try:
+            entered_key = input("Gemini API key: ").strip()
+        except EOFError:
+            entered_key = ""
+        if not entered_key:
+            console_print("A Gemini API key is required.")
+            return
+        set_gemini_api_key(entered_key)
 
     console_print("Chatbot is ready. Type /help for commands, or 'exit' to quit.")
 

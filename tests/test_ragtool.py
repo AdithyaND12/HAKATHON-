@@ -18,13 +18,12 @@ def test_retrieve_without_active_document_prompts_for_upload(monkeypatch):
     assert "No document has been uploaded" in out
 
 
-def test_embedding_model_uses_environment_configuration(monkeypatch):
-    monkeypatch.setattr(ragtool, "JINA_EMBEDDING_MODEL", "jina-test-model")
-    monkeypatch.setattr(ragtool, "JINA_API_KEY", "test-key")
+def test_embedding_model_uses_gemini_configuration(monkeypatch):
+    monkeypatch.setattr(ragtool, "GOOGLE_EMBEDDING_MODEL", "gemini-test-model")
 
     embedding_model = ragtool._get_embedding_model()
 
-    assert embedding_model.model_name == "jina-test-model"
+    assert embedding_model.model == "gemini-test-model"
 
 
 # ---- Uploaded-PDF support ----------------------------------------------------
@@ -62,17 +61,17 @@ def test_collection_name_is_hash_derived():
 
 
 def test_model_slug_is_filesystem_safe():
-    assert ragtool._model_slug("jina-embeddings-v4") == "jina-embeddings-v4"
+    assert ragtool._model_slug("gemini-embedding-001") == "gemini-embedding-001"
     assert ragtool._model_slug("Weird/Model NAME 2.0") == "weird-model-name-2.0"
     assert ragtool._model_slug("!!!") == "default"
 
 
 def test_persist_directory_is_namespaced_by_model(monkeypatch):
-    monkeypatch.setattr(ragtool, "JINA_EMBEDDING_MODEL", "jina-embeddings-v4")
+    monkeypatch.setattr(ragtool, "GOOGLE_EMBEDDING_MODEL", "gemini-embedding-001")
     import importlib
     importlib.reload(ragtool)
     assert "chroma_stores" in str(ragtool.PERSIST_DIRECTORY)
-    assert "jina-embeddings-v4" in str(ragtool.PERSIST_DIRECTORY)
+    assert "gemini-embedding-001" in str(ragtool.PERSIST_DIRECTORY)
 
 
 def test_persist_corruption_error_detection():
@@ -146,7 +145,7 @@ def test_index_pdf_builds_collection_and_writes_sidecar(monkeypatch, tmp_path):
     meta = json.loads((tmp_path / f".meta_{collection}.json").read_text(encoding="utf-8"))
     assert meta["name"] == "doc.pdf"
     assert meta["chunks"] == 1
-    assert meta["embedding_model"] == ragtool.JINA_EMBEDDING_MODEL
+    assert meta["embedding_model"] == ragtool.GOOGLE_EMBEDDING_MODEL
     assert (tmp_path / f".marker_{collection}").read_text(encoding="utf-8") == ragtool._expected_marker(sha)
     bm25 = json.loads(
         (tmp_path / f".bm25_{collection}.json").read_text(encoding="utf-8")
@@ -242,7 +241,6 @@ def test_retrieve_active_chunks_queries_uploaded_collection(monkeypatch, tmp_pat
     monkeypatch.setattr(ragtool, "_get_vectorstore", _Store)
     monkeypatch.setattr(ragtool.time, "sleep", lambda seconds: None)
     monkeypatch.setattr(ragtool, "PERSIST_DIRECTORY", tmp_path)
-    monkeypatch.setattr(ragtool, "RERANK_ENABLED", False)
 
     uploaded = ragtool.collection_name_for_sha("f" * 64)
     ragtool.set_active_collection(uploaded)
@@ -410,7 +408,6 @@ def test_retrieve_once_uses_mmr_for_diversity(monkeypatch, tmp_path):
     store = _MmrStore("x")
     monkeypatch.setattr(ragtool, "_get_vectorstore", lambda collection_name: store)
     monkeypatch.setattr(ragtool, "PERSIST_DIRECTORY", tmp_path)
-    monkeypatch.setattr(ragtool, "RERANK_ENABLED", False)
 
     out = ragtool._retrieve_once("speech", "rag_abc", 4)
 
@@ -419,11 +416,10 @@ def test_retrieve_once_uses_mmr_for_diversity(monkeypatch, tmp_path):
 
 
 def test_marker_includes_pipeline_version(monkeypatch):
-    monkeypatch.setattr(ragtool, "JINA_EMBEDDING_MODEL", "jina-embeddings-v4")
-    monkeypatch.setattr(ragtool, "_active_provider", "jina")
+    monkeypatch.setattr(ragtool, "GOOGLE_EMBEDDING_MODEL", "gemini-embedding-001")
     assert ragtool.INDEX_PIPELINE_VERSION >= 2
     assert ragtool._expected_marker("a" * 64) == (
-        f"jina:jina-embeddings-v4\n{ragtool.INDEX_PIPELINE_VERSION}\n{'a' * 64}"
+        f"google:gemini-embedding-001\n{ragtool.INDEX_PIPELINE_VERSION}\n{'a' * 64}"
     )
 
 
@@ -431,8 +427,7 @@ def test_marker_includes_pipeline_version(monkeypatch):
 
 
 def test_daily_quota_exhaustion_is_detected():
-    # Mirrors Jina's actual free-tier error text (their free endpoint is
-    # Gemini-backed, so the message references a Gemini model).
+    # Mirrors the Gemini embedding free-tier error text.
     daily = (
         "429 RESOURCE_EXHAUSTED. Quota exceeded for metric: "
         "generativelanguage.googleapis.com/embed_content_free_tier_requests, "
@@ -515,7 +510,7 @@ def test_selecting_raw_document_clears_indexed(monkeypatch, tmp_path):
     assert ragtool._ACTIVE_COLLECTION is None
 
 
-# ---- Hybrid retrieval: BM25 + RRF + reranker ---------------------------------
+# ---- Hybrid retrieval: BM25 + RRF ---------------------------------------------
 
 
 def test_bm25_prefers_exact_keyword_matches():
@@ -545,7 +540,6 @@ def test_hybrid_retrieval_adds_bm25_only_hits(monkeypatch, tmp_path):
 
     monkeypatch.setattr(ragtool, "_get_vectorstore", lambda name: _Store())
     monkeypatch.setattr(ragtool, "PERSIST_DIRECTORY", tmp_path)
-    monkeypatch.setattr(ragtool, "RERANK_ENABLED", False)
     ragtool._write_bm25_sidecar(
         "rag_kw",
         [
@@ -578,74 +572,7 @@ def test_bm25_rebuilds_from_vector_store_without_sidecar(monkeypatch, tmp_path):
 
     monkeypatch.setattr(ragtool, "_get_vectorstore", lambda name: _Store())
     monkeypatch.setattr(ragtool, "PERSIST_DIRECTORY", tmp_path)
-    monkeypatch.setattr(ragtool, "RERANK_ENABLED", False)
 
     out = ragtool._retrieve_once("article 21 liberty", "rag_nosidecar", 2)
 
     assert "Article 21 protects liberty" in out
-
-
-class _FakeRerankResponse:
-    def __init__(self, payload):
-        self._payload = payload
-
-    def raise_for_status(self):
-        return None
-
-    def json(self):
-        return self._payload
-
-
-def test_rerank_documents_orders_by_api_score(monkeypatch):
-    seen = {}
-
-    def fake_post(url, headers=None, json=None, timeout=None):
-        seen["url"] = url
-        seen["payload"] = json
-        return _FakeRerankResponse(
-            {
-                "results": [
-                    {"index": 1, "relevance_score": 0.9},
-                    {"index": 0, "relevance_score": 0.1},
-                ]
-            }
-        )
-
-    monkeypatch.setattr(ragtool.requests, "post", fake_post)
-    monkeypatch.setattr(ragtool, "JINA_API_KEY", "jina-test")
-    monkeypatch.setattr(ragtool, "RERANK_ENABLED", True)
-
-    documents = [Document(page_content="alpha"), Document(page_content="beta")]
-    out = ragtool._rerank_documents("question", documents, 2)
-
-    assert [doc.page_content for doc in out] == ["beta", "alpha"]
-    assert seen["url"] == "https://api.jina.ai/v1/rerank"
-    assert seen["payload"]["model"] == ragtool.JINA_RERANK_MODEL
-
-
-def test_rerank_skips_without_api_key(monkeypatch):
-    def boom(*args, **kwargs):
-        raise AssertionError("rerank API must not be called without a key")
-
-    monkeypatch.setattr(ragtool.requests, "post", boom)
-    monkeypatch.setattr(ragtool, "JINA_API_KEY", "")
-    monkeypatch.setattr(ragtool, "RERANK_ENABLED", True)
-
-    documents = [Document(page_content="alpha"), Document(page_content="beta")]
-    out = ragtool._rerank_documents("question", documents, 2)
-
-    assert [doc.page_content for doc in out] == ["alpha", "beta"]
-
-
-def test_rerank_falls_back_on_api_error(monkeypatch):
-    def fail(*args, **kwargs):
-        raise ragtool.requests.RequestException("service unavailable")
-
-    monkeypatch.setattr(ragtool.requests, "post", fail)
-    monkeypatch.setattr(ragtool, "JINA_API_KEY", "jina-test")
-    monkeypatch.setattr(ragtool, "RERANK_ENABLED", True)
-
-    documents = [Document(page_content="alpha"), Document(page_content="beta")]
-    out = ragtool._rerank_documents("question", documents, 2)
-
-    assert [doc.page_content for doc in out] == ["alpha", "beta"]

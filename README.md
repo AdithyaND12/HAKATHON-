@@ -22,9 +22,9 @@ The scheduling engine was rewritten to fix the pain points of the original:
   *"tomorrow 9am"*, or *"in 5 minutes"* are parsed and honored.
 - **Local planner** — recognises *hourly*, *daily*, *every day at X*, *twice*,
   *thrice*, *every N minutes*, and *in N minutes* with regexes, no extra LLM call.
-- **Separate embedding model** — `JINA_EMBEDDING_MODEL` keeps RAG aligned with
-  Jina's free embedding API (`jina-embeddings-v4`, 1M free tokens/day); the
-  chat LLM remains Gemini.
+- **One key for everything** — the user's Gemini key powers both the chat
+  model and PDF embeddings (`gemini-embedding-001`); no second provider or
+  API key is required. In the Streamlit UI the key can be pasted at runtime.
 - **Embedding-swap safety** — index markers record the embedding model + PDF
   hash, so switching embedding models automatically wipes and rebuilds any
   incompatible (old-dimension) Chroma collections.
@@ -36,7 +36,7 @@ The scheduling engine was rewritten to fix the pain points of the original:
 - Calculator and current-time tools.
 - Alpha Vantage stock-price lookup with structured error taxonomy.
 - Uploaded-PDF RAG using PyMuPDF, OCR fallback, heading-aware chunking,
-  contextual retrieval, a Jina embedding model, and Chroma — no built-in
+  contextual retrieval, Gemini embeddings, and Chroma — no built-in
   document; the user uploads the PDF.
 - Natural-language scheduling: *"check tesla news every 10 minutes for 5 times"*,
   *"search AI news at 3pm"*, *"monitor python news hourly"*.
@@ -53,8 +53,8 @@ The scheduling engine was rewritten to fix the pain points of the original:
 ## Requirements
 
 - Python 3.10 or newer.
-- A Gemini API key (chat model).
-- A Jina API key for the free embedding API (https://jina.ai/embeddings/).
+- A Gemini API key (used for both chat and PDF embeddings). Each user pastes
+  their own key in the Streamlit sidebar; it does not belong in `.env`.
 - An Alpha Vantage API key if stock-price lookups are required.
 
 ## Installation
@@ -86,16 +86,12 @@ cp .env.example .env
 
 | Variable | Required | Default | Description |
 | --- | --- | --- | --- |
-| `GEMINI_API_KEY` | Yes | — | Google Gemini API key. |
+| `GEMINI_API_KEY` | No | — | Optional override for CLI/API deployments. The Streamlit UI asks each user for their own key instead. |
 | `GEMINI_MODEL` | Yes | `gemini-3.5-flash-lite` | Chat model. |
 | `LLM_TIMEOUT_SECONDS` | No | `60` | Timeout for each LLM request (a short timeout makes the SDK retry every stalled call). |
 | `LLM_CLIENT_MAX_RETRIES` | No | `2` | SDK retries per LLM request. |
-| `JINA_API_KEY` | For RAG | — | Jina Embeddings API key (free tier: https://jina.ai/embeddings/). |
-| `JINA_EMBEDDING_MODEL` | No | `jina-embeddings-v4` | Free embedding model used for all RAG indexing + search. |
-| `JINA_RERANK_MODEL` | No | `jina-reranker-v3.5` | Cross-encoder reranker (uses the same `JINA_API_KEY`). |
-| `RERANK_ENABLED` | No | `true` | Enable reranking after hybrid retrieval. |
-| `RERANK_TIMEOUT_SECONDS` | No | `20` | Timeout for the rerank request; failures keep fusion order. |
-| `JINA_EMBEDDING_BATCH_SIZE` | No | `100` | Chunks per embedding request (one POST per batch). |
+| `GOOGLE_EMBEDDING_MODEL` | No | `gemini-embedding-001` | Gemini model used for all RAG indexing + search. |
+| `GOOGLE_EMBEDDING_BATCH_SIZE` | No | `32` | Chunks per embedding request (one POST per batch). |
 | `ALPHAVANTAGE_API_KEY` | For stocks | — | Alpha Vantage API key. |
 | `HTTP_TIMEOUT_SECONDS` | No | `10` | Timeout for stock API requests. |
 | `WAIT_MAX_SECONDS` | No | `3600` | Upper bound for a single `wait` / interval. |
@@ -105,12 +101,15 @@ cp .env.example .env
 | `SEARCH_MAX_RETRIES` | No | `3` | Retries for a single web_search invocation. |
 | `SEARCH_RETRY_BACKOFF_SECONDS` | No | `2.0` | Base backoff (doubles each retry). |
 
-The local `.env` file is ignored by Git. Never commit real API keys.
+The local `.env` file is ignored by Git and only holds optional tuning values.
+Never commit real API keys or put the Gemini key in `.env` for the Streamlit
+app.
 
 ## Running the chatbot (Streamlit UI)
 
 The primary interface is now a Streamlit web app with a dark, terminal-inspired
-aesthetic. Set your Gemini env vars, then:
+aesthetic. No Gemini key is needed in the environment — start it, then paste
+your key in the sidebar:
 
 ```bash
 streamlit run streamlit_app.py
@@ -120,8 +119,16 @@ Open the URL Streamlit prints (usually http://localhost:8501). The interface is
 intentionally minimal: one chat window. Scheduling still works — just describe
 it in natural language.
 
+The app opens with a key prompt in the sidebar: paste your Gemini API key
+there and click **save key**. That single key is used for chat and PDF
+embeddings. It is kept in server memory (not written to disk), and is never
+saved back to `.env`. An existing `GEMINI_API_KEY` environment/secret value is
+still honored as a fallback for CLI or API deployments.
+
 UI niceties:
 
+- **Bring your own key** — enter/replace the Gemini key from the sidebar at any
+  time, without editing `.env` or restarting the app.
 - **Multi-turn memory** — prior turns are fed to the model (budget-trimmed to
   the last ~20 messages / ~24k chars), so follow-ups like "and what about
   TSLA?" actually work.
@@ -212,10 +219,10 @@ Slash commands: `/help /jobs /cancel <id> /pause <id> /resume <id> /logs <id>
 There is no built-in document: the user uploads PDFs (via the Streamlit sidebar
 or the FastAPI endpoints), and each is indexed into its own hash-derived Chroma
 collection under `chroma_stores/<embedding-model>/` (e.g.
-`chroma_stores/jina-embeddings-v4/`). The LLM's `get_rag_chunks` tool queries
+`chroma_stores/gemini-embedding-001/`). The LLM's `get_rag_chunks` tool queries
 whichever document is selected as active — and that selection is persisted
-next to the store so it survives restarts. `JINA_API_KEY` must be set; the
-embedding model defaults to `jina-embeddings-v4` (free tier: 1M tokens/day).
+next to the store so it survives restarts. The Gemini API key powers the
+embeddings too; the model defaults to `gemini-embedding-001`.
 
 ### Indexing pipeline
 
@@ -235,9 +242,6 @@ embedding model defaults to `jina-embeddings-v4` (free tier: 1M tokens/day).
   so exact names, numbers, and section terms are not lost to embedding drift.
   BM25 data is stored in a `.bm25_<collection>.json` sidecar; older indexes
   rebuild it from stored metadata on first query.
-- **Cross-encoder reranking** — the fused candidates are reordered by Jina's
-  reranker (`jina-reranker-v3.5`, same `JINA_API_KEY`) before returning top-k.
-  Missing key, disabled setting, or an API error silently keeps fusion order.
 
 ### Robustness and freshness
 
@@ -248,7 +252,7 @@ embedding model defaults to `jina-embeddings-v4` (free tier: 1M tokens/day).
   embedding model or changing the chunking/contextualization logic
   automatically wipes and rebuilds incompatible stores instead of silently
   serving stale vectors.
-- **Embedding resilience** — batches (default 100 chunks per request) retry
+- **Embedding resilience** — batches (default 32 chunks per request) retry
   with backoff on transient 429/5xx errors and fail fast when the provider's
   daily quota is exhausted; indexing resumes automatically after the reset.
 - **Self-healing stores** — corrupt / half-written Chroma stores are detected
@@ -294,14 +298,13 @@ chroma_stores/       Vector stores (one dir per embedding model) — git-ignored
 
 ## Troubleshooting
 
-- **Gemini authentication error**: confirm `GEMINI_API_KEY` is set correctly in
-  your `.env`.
-- **Embedding API error (RAG)**: confirm `JINA_API_KEY` is set correctly in your
-  `.env` (get a free key at https://jina.ai/embeddings/).
-- **Free-tier embedding limits**: the Jina free tier covers 1M tokens/day at
-  100 requests/minute, and `jina-embeddings-v4` is additionally throttled by
-  design. If a batch fails on rate limits the retry/backoff handles it; if your
-  day's tokens run out, indexing resumes automatically after the reset.
+- **Gemini authentication error**: paste a valid key in the Streamlit sidebar.
+  `.env` is intentionally not used for the Gemini key.
+- **Embedding API error (RAG)**: the same Gemini key powers embeddings — check
+  that it is valid and has quota for `gemini-embedding-001`.
+- **Free-tier embedding limits**: if a batch fails on rate limits the
+  retry/backoff handles it; if the day's quota runs out, indexing resumes
+  automatically after the reset.
 - **Embedding model changed?** Nothing to do — stores are namespaced per
   embedding model (`chroma_stores/<model>/`) and old-dimension vectors are
   detected as incompatible and rebuilt automatically on next use.

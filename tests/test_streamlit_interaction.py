@@ -38,7 +38,7 @@ def fake_ai(monkeypatch, tmp_path):
     monkeypatch.setattr(
         ragtool,
         "PERSIST_DIRECTORY",
-        ragtool.STORE_ROOT / ragtool._model_slug(config.JINA_EMBEDDING_MODEL),
+        ragtool.STORE_ROOT / ragtool._model_slug(config.GOOGLE_EMBEDDING_MODEL),
     )
 
     import app

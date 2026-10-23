@@ -6,7 +6,6 @@ from pathlib import Path
 # syntactically valid key even though no network call is made. Tests that
 # exercise real requests monkeypatch the client, so this only unblocks import.
 os.environ.setdefault("GEMINI_API_KEY", "test-key")
-os.environ.setdefault("JINA_API_KEY", "test-key")
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:

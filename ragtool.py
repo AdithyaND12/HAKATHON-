@@ -1,4 +1,4 @@
-"""PDF RAG using Jina's free embedding API.
+"""PDF RAG using Gemini's embedding API.
 
 There is no built-in document: the user uploads PDFs (via the web UI), and
 each is indexed into its own hash-derived Chroma collection so the LLM's
@@ -6,12 +6,12 @@ each is indexed into its own hash-derived Chroma collection so the LLM's
 active.
 
 Key design points:
-    * Embeddings come from Jina (`JinaEmbeddings`, free tier); the chat LLM
-      is untouched and stays a Gemini model.
+    * One Gemini API key powers both the chat model and the embeddings
+      (`gemini-embedding-001`); no second provider is required.
     * Index markers record BOTH the embedding model and the PDF sha256, so
       switching embedding models automatically invalidates the old vectors
       (vectors from a different model have a different dimension and are
-      incompatible with a Chroma collection built by Jina) and triggers a safe
+      incompatible with the existing Chroma collection) and triggers a safe
       rebuild.
     * Import from `langchain_chroma` when available; fall back to the
       deprecated `langchain_community.vectorstores.Chroma` so existing
@@ -32,12 +32,10 @@ from pathlib import Path
 from typing import Callable, Optional
 
 import pymupdf
-import requests
 from chromadb import PersistentClient
 from chromadb.config import Settings
 from langchain_core.documents import Document
 from langchain_core.embeddings import Embeddings
-from langchain_community.embeddings import JinaEmbeddings
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
 try:
@@ -56,67 +54,17 @@ except ImportError:  # pragma: no cover - environment-dependent import.
 
 
 # Constants preserved as module attributes so tests can monkeypatch them.
-GEMINI_MODEL = config.GEMINI_MODEL
-GEMINI_API_KEY = config.GEMINI_API_KEY
-JINA_API_KEY = config.JINA_API_KEY
-JINA_RERANK_MODEL = config.JINA_RERANK_MODEL
-RERANK_ENABLED = config.RERANK_ENABLED
-RERANK_TIMEOUT_SECONDS = config.RERANK_TIMEOUT_SECONDS
-JINA_EMBEDDING_MODEL = config.JINA_EMBEDDING_MODEL
-EMBEDDING_PROVIDER = config.EMBEDDING_PROVIDER
 GOOGLE_EMBEDDING_MODEL = config.GOOGLE_EMBEDDING_MODEL
-HTTP_TIMEOUT_SECONDS = config.HTTP_TIMEOUT_SECONDS
-JINA_EMBED_BATCH_SIZE = config.JINA_EMBEDDING_BATCH_SIZE
 GOOGLE_EMBED_BATCH_SIZE = config.GOOGLE_EMBEDDING_BATCH_SIZE
-
-# Active provider can be changed at runtime via set_embedding_provider().
-_active_provider = EMBEDDING_PROVIDER
-
-
-def get_embedding_provider() -> str:
-    """Return the currently active embedding provider name."""
-    return _active_provider
 
 
 def get_embedding_model_name() -> str:
-    """Return the model name for the currently active embedding provider."""
-    if _active_provider == "google":
-        return GOOGLE_EMBEDDING_MODEL
-    return JINA_EMBEDDING_MODEL
-
-
-def set_embedding_provider(provider: str) -> None:
-    """Switch the embedding provider at runtime ('jina' or 'google').
-
-    Resets the shared Chroma client so the next operation uses a store
-    namespaced to the new provider+model.
-    """
-    global _active_provider, _CLIENT, PERSIST_DIRECTORY, _ACTIVE_COLLECTION
-    if not isinstance(provider, str) or not provider.strip():
-        raise ValueError(
-            "Embedding provider must be 'jina' or 'google'."
-        )
-    provider = provider.strip().lower()
-    if provider not in ("jina", "google"):
-        raise ValueError(f"Unknown embedding provider: {provider!r} (expected 'jina' or 'google')")
-    if provider == _active_provider:
-        return
-    _active_provider = provider
-    _BM25_CACHE.clear()
-    # Active IDs are namespaced to the old store; do not leak them into the
-    # new provider, where they would silently resolve to an empty collection.
-    _ACTIVE_COLLECTION = None
-    global _ACTIVE_RAW
-    _ACTIVE_RAW = None
-    # Keep the module-level directory in sync: it is the single source of
-    # truth used by every marker/meta path and can be overridden by callers.
-    PERSIST_DIRECTORY = STORE_ROOT / _active_model_slug()
-    # Reset client so it is re-created inside the new provider's store.
-    _CLIENT = None
+    """Return the embedding model used for every RAG collection."""
+    return GOOGLE_EMBEDDING_MODEL
 
 
 def _model_slug(model_name: str) -> str:
-    """Filesystem-safe name for a model, e.g. ``jina-embeddings-v4``."""
+    """Filesystem-safe name for a model, e.g. ``gemini-embedding-001``."""
     slug = re.sub(r"[^a-z0-9._-]+", "-", model_name.lower()).strip("-._")
     return slug or "default"
 
@@ -126,15 +74,7 @@ def _model_slug(model_name: str) -> str:
 # new model's collections query-time-unusable. Namespacing means switching
 # embedding models can never touch another model's store.
 STORE_ROOT = Path(__file__).resolve().parent / "chroma_stores"
-# One persist directory PER embedding model: vectors from a different model
-# (different dimension) are incompatible. Namespacing by provider+model means
-# switching embedding models can never touch another model's store.
-def _active_model_slug() -> str:
-    if _active_provider == "google":
-        return _model_slug(GOOGLE_EMBEDDING_MODEL)
-    return _model_slug(JINA_EMBEDDING_MODEL)
-
-PERSIST_DIRECTORY = STORE_ROOT / _active_model_slug()
+PERSIST_DIRECTORY = STORE_ROOT / _model_slug(GOOGLE_EMBEDDING_MODEL)
 
 
 def _persist_dir() -> Path:
@@ -145,10 +85,8 @@ DEFAULT_TOP_K = 4
 
 
 def _embed_batch_size() -> int:
-    """Chunks per embedding batch, provider-aware."""
-    if _active_provider == "google":
-        return GOOGLE_EMBED_BATCH_SIZE
-    return JINA_EMBED_BATCH_SIZE
+    """Chunks per embedding batch."""
+    return GOOGLE_EMBED_BATCH_SIZE
 
 
 def _ocr_page(page) -> str:
@@ -280,26 +218,25 @@ def _split_documents(documents: list[Document]) -> list[Document]:
 
 
 def _get_embedding_model() -> Embeddings:
-    """Return the configured embedding model (Jina or Google)."""
-    if _active_provider == "google":
-        if GoogleGenerativeAIEmbeddings is None:
-            raise ImportError(
-                "langchain-google-genai is required for Google embeddings. "
-                "Install it with: pip install langchain-google-genai"
-            )
-        return GoogleGenerativeAIEmbeddings(
-            model=GOOGLE_EMBEDDING_MODEL,
-            google_api_key=GEMINI_API_KEY,
+    """Return the Gemini embedding model configured for RAG."""
+    if GoogleGenerativeAIEmbeddings is None:
+        raise ImportError(
+            "langchain-google-genai is required for Gemini embeddings. "
+            "Install it with: pip install langchain-google-genai"
         )
-    # Default: Jina
-    return JinaEmbeddings(
-        model_name=JINA_EMBEDDING_MODEL,
-        jina_api_key=JINA_API_KEY,
+    if not config.GEMINI_API_KEY:
+        raise ValueError(
+            "GEMINI_API_KEY is not configured. Add your Gemini API key in the "
+            "sidebar or set it in .env."
+        )
+    return GoogleGenerativeAIEmbeddings(
+        model=GOOGLE_EMBEDDING_MODEL,
+        google_api_key=config.GEMINI_API_KEY,
     )
 
 
 _CLIENT: Optional[PersistentClient] = None
-_CLIENT_PROVIDER: Optional[str] = None  # tracks which provider the client was created for
+_CLIENT_DIR: Optional[Path] = None
 
 
 def _get_client() -> PersistentClient:
@@ -310,18 +247,18 @@ def _get_client() -> PersistentClient:
     other client's still-pending writes, causing spurious "collection not
     initialized" failures. A single shared client keeps index + query coherent.
 
-    The client is reset when the embedding provider changes so the store
-    directory is re-evaluated for the new provider+model namespace.
+    The client is reset when the persist directory changes (tests/deployments
+    can repoint ``PERSIST_DIRECTORY``).
     """
-    global _CLIENT, _CLIENT_PROVIDER
+    global _CLIENT, _CLIENT_DIR
     current_dir = _persist_dir()
-    if _CLIENT is None or _CLIENT_PROVIDER != _active_provider:
+    if _CLIENT is None or _CLIENT_DIR != current_dir:
         current_dir.mkdir(parents=True, exist_ok=True)
         # allow_reset lets the corruption self-heal wipe the store in-process.
         _CLIENT = PersistentClient(
             path=str(current_dir), settings=Settings(allow_reset=True)
         )
-        _CLIENT_PROVIDER = _active_provider
+        _CLIENT_DIR = current_dir
     return _CLIENT
 
 
@@ -422,9 +359,9 @@ def _add_documents_with_retries(vectorstore: Chroma, documents: list[Document]) 
         except Exception as exc:  # noqa: BLE001
             if _is_daily_quota_exhausted(exc):
                 log.error(
-                    "Embedding stopped: the provider's daily request quota for "
+                    "Embedding stopped: the Gemini API daily request quota for "
                     "%s is exhausted (resets daily). Retrying cannot help: %s",
-                    JINA_EMBEDDING_MODEL,
+                    GOOGLE_EMBEDDING_MODEL,
                     exc,
                 )
                 raise
@@ -444,16 +381,15 @@ INDEX_PIPELINE_VERSION = 2
 
 
 def _expected_marker(pdf_sha256: str) -> str:
-    """Marker content = embedding provider + model + pipeline version + pdf hash.
+    """Marker content = embedding model + pipeline version + pdf hash.
 
-    Including the provider and model means switching to a different embedding
-    model or provider invalidates every old collection automatically,
-    since vectors from a different model/dimension are incompatible. The
-    pipeline version additionally invalidates collections whose vectors were
-    produced by an older chunking/contextualization logic.
+    Including the model means switching to a different embedding model
+    invalidates every old collection automatically, since vectors from a
+    different model/dimension are incompatible. The pipeline version
+    additionally invalidates collections whose vectors were produced by an
+    older chunking/contextualization logic.
     """
-    model = GOOGLE_EMBEDDING_MODEL if _active_provider == "google" else JINA_EMBEDDING_MODEL
-    return f"{_active_provider}:{model}\n{INDEX_PIPELINE_VERSION}\n{pdf_sha256}"
+    return f"google:{GOOGLE_EMBEDDING_MODEL}\n{INDEX_PIPELINE_VERSION}\n{pdf_sha256}"
 
 
 def _format_results(results: list[Document]) -> str:
@@ -477,13 +413,12 @@ def _format_results(results: list[Document]) -> str:
 # cosine hits are often near-duplicate passages of one paragraph.
 MMR_FETCH_MULTIPLIER = 5
 
-# ---- Hybrid retrieval: BM25 + vector + cross-encoder rerank ------------------
+# ---- Hybrid retrieval: BM25 + vector -----------------------------------------
 
 BM25_K1 = 1.5
 BM25_B = 0.75
 RRF_K = 60
 BM25_SIDECAR_VERSION = 1
-RERANK_MAX_CANDIDATES = 20
 BM25_STOPWORDS = frozenset(
     "a an and are as at be but by for from has have in is it its of on or that "
     "the their this to was were will with".split()
@@ -561,7 +496,7 @@ def _bm25_sidecar_path(collection_name: str) -> Path:
 
 
 def _bm25_cache_key(collection_name: str) -> str:
-    return f"{_persist_dir()}:{_active_provider}:{collection_name}"
+    return f"{_persist_dir()}:{collection_name}"
 
 
 def _bm25_entries_from_chunks(chunks: list[Document]) -> list[dict]:
@@ -663,62 +598,12 @@ def _reciprocal_rank_fusion(rankings: list[list[str]], limit: int) -> list[str]:
     ]
 
 
-def _rerank_documents(
-    query: str, documents: list[Document], top_n: int
-) -> list[Document]:
-    """Reorder fused candidates with Jina's cross-encoder reranker.
-
-    Uses the same JINA_API_KEY as embeddings. Any missing key, disabled
-    setting, or API failure keeps the fusion order rather than failing the
-    request.
-    """
-    candidates = documents[:RERANK_MAX_CANDIDATES]
-    if not RERANK_ENABLED or not JINA_API_KEY or len(candidates) <= 1 or top_n <= 0:
-        return candidates[:top_n]
-    texts = [
-        (document.metadata.get("raw_text") or document.page_content)[:4000]
-        for document in candidates
-    ]
-    try:
-        response = requests.post(
-            "https://api.jina.ai/v1/rerank",
-            headers={
-                "Authorization": f"Bearer {JINA_API_KEY}",
-                "Content-Type": "application/json",
-            },
-            json={
-                "model": JINA_RERANK_MODEL,
-                "query": query,
-                "documents": texts,
-                "top_n": min(top_n, len(texts)),
-                "return_documents": False,
-            },
-            timeout=RERANK_TIMEOUT_SECONDS,
-        )
-        response.raise_for_status()
-        results = response.json().get("results") or []
-    except (requests.RequestException, ValueError) as exc:
-        log.warning("Reranking unavailable (%s); keeping fusion order.", exc)
-        return candidates[:top_n]
-
-    ordered: list[Document] = []
-    seen: set[int] = set()
-    for result in sorted(
-        results, key=lambda item: item.get("relevance_score", 0.0), reverse=True
-    ):
-        index = result.get("index")
-        if isinstance(index, int) and 0 <= index < len(candidates) and index not in seen:
-            seen.add(index)
-            ordered.append(candidates[index])
-    return ordered[:top_n] or candidates[:top_n]
-
-
 def _retrieve_once(query: str, collection_name: str, k: int) -> str:
-    """Hybrid retrieval: vector search + BM25, fused with RRF, then reranked.
+    """Hybrid retrieval: vector search + BM25, fused with RRF.
 
     The vector arm keeps MMR diversity over a wider candidate set; BM25 adds
     exact keyword/name/number matching that embeddings often miss. RRF merges
-    both rankings, then the cross-encoder reranker chooses the final `k`.
+    both rankings before the final `k` passages are returned.
     """
     vectorstore = _get_vectorstore(collection_name)
     candidate_k = max(k * MMR_FETCH_MULTIPLIER, k)
@@ -755,7 +640,7 @@ def _retrieve_once(query: str, collection_name: str, k: int) -> str:
     documents = [by_key[key] for key in fused_keys if key in by_key]
     if not documents:
         documents = vector_docs
-    return _format_results(_rerank_documents(query, documents, k))
+    return _format_results(documents[:k])
 
 
 def _reindex_collection(collection_name: str) -> bool:
@@ -947,8 +832,8 @@ def index_pdf(
                 "name": name or path.name,
                 "source": str(path),
                 "sha256": sha,
-                "embedding_provider": _active_provider,
-                "embedding_model": GOOGLE_EMBEDDING_MODEL if _active_provider == "google" else JINA_EMBEDDING_MODEL,
+                "embedding_provider": "google",
+                "embedding_model": GOOGLE_EMBEDDING_MODEL,
                 "pages": len(pages),
                 "chunks": total,
                 "indexed_at": datetime.now(timezone.utc).isoformat(),

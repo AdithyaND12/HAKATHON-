@@ -209,7 +209,7 @@ MAX_UPLOAD_BYTES = 50 * 1024 * 1024
 
 @app.post("/documents/upload")
 async def upload_document(file: UploadFile = File(...)):
-    """Upload a PDF, index it using Jina Embeddings, and activate it for RAG queries."""
+    """Upload a PDF, index it using Gemini embeddings, and activate it for RAG queries."""
     filename = (file.filename or "").strip()
     if not filename.lower().endswith(".pdf"):
         raise HTTPException(

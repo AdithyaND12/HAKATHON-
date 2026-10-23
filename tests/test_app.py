@@ -186,3 +186,44 @@ def test_schedule_does_not_wait_after_final_run(monkeypatch):
 
     assert time.monotonic() - started < 0.5
     assert len(job.results) == 1
+
+
+def test_user_supplied_gemini_key_rebuilds_llm(monkeypatch):
+    import config
+
+    original_key = config.GEMINI_API_KEY
+    original_state = (
+        app.llm,
+        app.llm_with_tools,
+        app.scheduled_llm_with_tools,
+    )
+    built = []
+
+    class FakeLLM:
+        def bind_tools(self, tools):
+            return self
+
+    monkeypatch.setattr(
+        app,
+        "build_chat_llm",
+        lambda model=None: built.append(model) or FakeLLM(),
+    )
+    try:
+        app.set_gemini_api_key("  user-supplied-key  ")
+
+        assert config.GEMINI_API_KEY == "user-supplied-key"
+        assert app.llm is not None
+        assert app.llm_with_tools is app.llm
+        assert built == [config.GEMINI_MODEL]
+
+        app.set_gemini_api_key("")
+        assert config.GEMINI_API_KEY == ""
+        assert app.llm is None
+        assert app.llm_with_tools is None
+    finally:
+        config.set_gemini_api_key(original_key)
+        (
+            app.llm,
+            app.llm_with_tools,
+            app.scheduled_llm_with_tools,
+        ) = original_state

@@ -14,9 +14,7 @@ load_dotenv()
 # ---- Defaults -----------------------------------------------------------------
 
 DEFAULT_GEMINI_MODEL = "gemini-3.5-flash-lite"
-DEFAULT_JINA_EMBEDDING_MODEL = "jina-embeddings-v4"
 DEFAULT_GEMINI_EMBEDDING_MODEL = "gemini-embedding-001"
-DEFAULT_EMBEDDING_PROVIDER = "jina"
 _RETIRED_GEMINI_MODELS = {
     "gemini-1.5-flash": "gemini-3.5-flash-lite",
     "models/gemini-1.5-flash": "gemini-3.5-flash-lite",
@@ -34,8 +32,6 @@ GEMINI_MODEL_OPTIONS = {
     "Gemma 4 26B MoE IT": "gemma-4-26b-a4b-it",
 }
 DEFAULT_HTTP_TIMEOUT_SECONDS = 10.0
-DEFAULT_JINA_RERANK_MODEL = "jina-reranker-v3.5"
-DEFAULT_RERANK_TIMEOUT_SECONDS = 20.0
 # LLM calls need a much longer timeout than the stock API: Gemini routinely
 # takes longer than 10s under load, and a short timeout triggers the SDK's
 # retry loop (default 6 attempts), which multiplies every stall.
@@ -126,18 +122,24 @@ _legacy_lm_studio_api_key = env_str("LM_STUDIO_API_KEY", "")
 _configured_model = env_str("GEMINI_MODEL", _legacy_lm_studio_model or DEFAULT_GEMINI_MODEL)
 GEMINI_MODEL = _RETIRED_GEMINI_MODELS.get(_configured_model, _configured_model)
 
-# Embeddings come from Jina's free API; the chat LLM stays Gemini.
-JINA_API_KEY = env_str("JINA_API_KEY") or streamlit_secret("JINA_API_KEY")
-JINA_EMBEDDING_MODEL = env_str("JINA_EMBEDDING_MODEL", DEFAULT_JINA_EMBEDDING_MODEL)
-# Reranking uses the same Jina key as embeddings (api.jina.ai/v1/rerank).
-JINA_RERANK_MODEL = env_str("JINA_RERANK_MODEL", DEFAULT_JINA_RERANK_MODEL)
-RERANK_ENABLED = env_bool("RERANK_ENABLED", True)
-RERANK_TIMEOUT_SECONDS = env_float("RERANK_TIMEOUT_SECONDS", DEFAULT_RERANK_TIMEOUT_SECONDS)
+# A single Gemini key powers both chat and PDF embeddings. In the Streamlit
+# UI the user can enter their own key at runtime via `set_gemini_api_key`.
 GEMINI_API_KEY = (
     env_str("GEMINI_API_KEY", env_str("GOOGLE_API_KEY", _legacy_lm_studio_api_key))
     or streamlit_secret("GEMINI_API_KEY")
     or streamlit_secret("GOOGLE_API_KEY")
 )
+
+
+def set_gemini_api_key(api_key: str) -> None:
+    """Set the Gemini API key for the current process at runtime.
+
+    Used by the Streamlit UI when a user pastes their own key. Environment
+    values are still the fallback for CLI/API deployments.
+    """
+    global GEMINI_API_KEY, LM_STUDIO_API_KEY
+    GEMINI_API_KEY = (api_key or "").strip()
+    LM_STUDIO_API_KEY = GEMINI_API_KEY
 
 # Backward-compatible aliases for older imports.
 LM_STUDIO_MODEL = GEMINI_MODEL
@@ -159,21 +161,10 @@ MAX_SCHEDULE_INTERVAL_MINUTES = env_float(
 )
 MAX_AUTO_RUNS = env_int("MAX_AUTO_RUNS", DEFAULT_MAX_AUTO_RUNS)
 DATA_DIR = env_path("HAKATHON_DATA_DIR", DEFAULT_DATA_DIR)
-# Chunks per embedding request to Jina (one HTTP POST per batch). Batches of
-# ~100 keep request counts low on the free tier (1M tokens/day, 100 RPM).
-JINA_EMBEDDING_BATCH_SIZE = env_int("JINA_EMBEDDING_BATCH_SIZE", 32)
-
-# Embedding provider: "jina" (default, free tier) or "google" (Gemini embeddings).
-_configured_embedding_provider = env_str(
-    "EMBEDDING_PROVIDER", DEFAULT_EMBEDDING_PROVIDER
-).lower()
-EMBEDDING_PROVIDER = (
-    _configured_embedding_provider
-    if _configured_embedding_provider in {"jina", "google"}
-    else DEFAULT_EMBEDDING_PROVIDER
-)
-GOOGLE_EMBEDDING_MODEL = env_str("GOOGLE_EMBEDDING_MODEL", DEFAULT_GEMINI_EMBEDDING_MODEL)
+# Chunks per embedding request to Gemini (one HTTP POST per batch).
 GOOGLE_EMBEDDING_BATCH_SIZE = env_int("GOOGLE_EMBEDDING_BATCH_SIZE", 32)
+
+GOOGLE_EMBEDDING_MODEL = env_str("GOOGLE_EMBEDDING_MODEL", DEFAULT_GEMINI_EMBEDDING_MODEL)
 
 DUCKDUCKGO_REGION = env_str("DUCKDUCKGO_REGION", "us-en")
 SEARCH_MAX_RETRIES = env_int("SEARCH_MAX_RETRIES", 3)

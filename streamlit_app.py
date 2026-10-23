@@ -59,19 +59,9 @@ except ImportError:  # pragma: no cover - only hit when the optional dep is miss
 # Reuse everything the CLI used.
 import config
 
-# Fail with an actionable message instead of a raw pydantic ValidationError:
-# importing `app` below builds the Gemini client, which requires the key.
-if not config.GEMINI_API_KEY:
-    st.error(
-        "**GEMINI_API_KEY is not set.** Open *App settings → Secrets* and add "
-        'it as a root-level entry (not inside a `[section]`):\n\n'
-        '```toml\nGEMINI_API_KEY = "your-google-ai-studio-key"\n```\n\n'
-        "Then save to reboot the app."
-    )
-    st.stop()
-
 import ragtool
-from app import _registry, chatbot, llm, scheduler, set_chatbot_model
+import app as app_module
+from app import _registry, chatbot, scheduler, set_chatbot_model, set_gemini_api_key
 from planner import (
     CalculationExecutionInstruction,
     ChatExecutionInstruction,
@@ -916,7 +906,7 @@ def _auto_title_conversation(history: list[dict], current_title: str) -> str:
     if not user_text:
         return current_title
     try:
-        out = llm.invoke(
+        out = app_module.llm.invoke(
             [
                 SystemMessage(
                     content=(
@@ -1061,6 +1051,28 @@ st.markdown(
 # ---- Sidebar (health, RAG documents, reset) ---------------------------------
 
 with st.sidebar:
+    st.markdown("### api key")
+    if config.GEMINI_API_KEY:
+        st.caption("Gemini key active — used for chat **and** PDF embeddings.")
+    else:
+        st.caption("Paste your own Gemini API key to start chatting.")
+    api_key_input = st.text_input(
+        "Gemini API key",
+        type="password",
+        placeholder="AIza...",
+        key="gemini_api_key_input",
+        label_visibility="collapsed",
+    )
+    if st.button("save key", use_container_width=True):
+        if api_key_input.strip():
+            set_gemini_api_key(api_key_input.strip())
+            st.toast("Gemini API key applied.")
+            st.rerun()
+        else:
+            st.warning("Enter a Gemini API key first.")
+    st.caption("Kept in server memory; never written to disk.")
+
+    st.divider()
     st.markdown("### chats")
 
     if st.button("＋ new chat", use_container_width=True):
@@ -1116,54 +1128,39 @@ with st.sidebar:
     st.divider()
     st.markdown("### session")
 
-    model_labels = list(config.GEMINI_MODEL_OPTIONS)
-    default_label = next(
-        (
-            label
-            for label, model_id in config.GEMINI_MODEL_OPTIONS.items()
-            if model_id == config.GEMINI_MODEL
-        ),
-        model_labels[0],
-    )
-    picked_model = st.selectbox(
-        "model",
-        options=model_labels,
-        index=model_labels.index(default_label),
-        key="model_picker",
-    )
-    # `app.llm` already uses config.GEMINI_MODEL at import, so the first run
-    # must NOT rebuild it — only rebuild when the user actively switches models.
-    if "_active_model_label" not in st.session_state:
-        st.session_state["_active_model_label"] = picked_model
-    elif picked_model != st.session_state["_active_model_label"]:
-        set_chatbot_model(config.GEMINI_MODEL_OPTIONS[picked_model])
-        st.session_state["_active_model_label"] = picked_model
-    st.caption(f"active: **{st.session_state['_active_model_label']}**")
-
-    # Embedding provider selector
-    embedding_options = ["jina", "google"]
-    current_provider = ragtool.get_embedding_provider()
-    picked_embedding = st.selectbox(
-        "embedding",
-        options=embedding_options,
-        index=embedding_options.index(current_provider),
-        key="embedding_provider_picker",
-        help="Jina (free tier) or Google Gemini embeddings for RAG.",
-    )
-    if picked_embedding and picked_embedding != current_provider:
-        ragtool.set_embedding_provider(picked_embedding)
-        st.rerun()
-
-    if st.session_state.get("rag_mode", True):
-        st.caption(f"embedding model: `{ragtool.get_embedding_model_name()}`")
-        rerank_label = (
-            f"`{ragtool.JINA_RERANK_MODEL}`"
-            if ragtool.RERANK_ENABLED and ragtool.JINA_API_KEY
-            else "off (add JINA_API_KEY)"
+    if config.GEMINI_API_KEY:
+        model_labels = list(config.GEMINI_MODEL_OPTIONS)
+        default_label = next(
+            (
+                label
+                for label, model_id in config.GEMINI_MODEL_OPTIONS.items()
+                if model_id == config.GEMINI_MODEL
+            ),
+            model_labels[0],
         )
-        st.caption(f"retrieval: BM25 + vector · rerank: {rerank_label}")
+        picked_model = st.selectbox(
+            "model",
+            options=model_labels,
+            index=model_labels.index(default_label),
+            key="model_picker",
+        )
+        # `app.llm` already uses config.GEMINI_MODEL when the key was configured,
+        # so the first run must NOT rebuild it — only rebuild on a real switch.
+        if "_active_model_label" not in st.session_state:
+            st.session_state["_active_model_label"] = picked_model
+        elif picked_model != st.session_state["_active_model_label"]:
+            set_chatbot_model(config.GEMINI_MODEL_OPTIONS[picked_model])
+            st.session_state["_active_model_label"] = picked_model
+        st.caption(f"active: **{st.session_state['_active_model_label']}**")
+
+        if st.session_state.get("rag_mode", True):
+            st.caption(f"embedding model: `{ragtool.get_embedding_model_name()}` (Gemini)")
+            st.caption("retrieval: BM25 + vector")
+        else:
+            st.caption("embedding: off (raw mode)")
     else:
-        st.caption("embedding: off (raw mode)")
+        st.caption("Add a Gemini API key above to enable chat and embeddings.")
+
     active = _registry.active()
     st.caption(f"active schedules: **{len(active)}**")
     if active:
@@ -1289,6 +1286,17 @@ with st.sidebar:
         for job in _registry.active():
             job.stop()
         st.toast(f"Cancelled {len(_registry.active())} job(s)")
+
+
+# ---- API key gate ------------------------------------------------------------
+
+if not config.GEMINI_API_KEY:
+    st.info(
+        "Paste your **Gemini API key** in the sidebar to start. The same key "
+        "powers chat and PDF embeddings — no separate embedding provider is "
+        "needed."
+    )
+    st.stop()
 
 
 # ---- Record newly-completed scheduled runs ------------------------------------

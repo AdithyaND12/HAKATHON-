@@ -194,7 +194,7 @@ rounded((110, 2400, 640, 2500),
 rounded((700, 2400, 1230, 2500),
         "heading-aware chunks (500/50)\ncontext tag [doc > section]", fnt=F_TINY)
 rounded((1290, 2400, 1820, 2500),
-        "Jina embeddings · batch 100\nretry/backoff · fail-fast on quota", fnt=F_TINY)
+        "Gemini embeddings · batch 32\nretry/backoff · fail-fast on quota", fnt=F_TINY)
 rounded((1880, 2400, 2470, 2500),
         "Chroma rag_<sha16> · marker file\nMMR diverse top-4 → get_rag_chunks", fnt=F_TINY)
 

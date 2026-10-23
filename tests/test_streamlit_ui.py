@@ -44,6 +44,9 @@ def _stub_streamlit_and_load(tmp_path, monkeypatch):
     st.chat_message = lambda *a, **k: _NullContext()
     st.chat_input = lambda *a, **k: None
     st.warning = st.error = st.rerun = lambda *a, **k: None
+    st.info = lambda *a, **k: None
+    st.stop = lambda *a, **k: None
+    st.text_input = lambda *a, **k: ""
     st.spinner = lambda *a, **k: _NullContext()
     st.file_uploader = lambda *a, **k: None
     st.selectbox = lambda *a, **k: None
