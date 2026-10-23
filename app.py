@@ -3,7 +3,7 @@
 Dedicated logic lives in modules:
 
     config.py         — env parsing
-    planner.py        — search + schedule planner (LLM + regex fallback)
+    planner.py        — search + schedule planner (regex-only)
     scheduler.py      — background job registry, persistence, retries
     tools_search.py   — DuckDuckGo tool wrapped with retry/backoff
     ragtool.py        — user-uploaded PDF RAG
@@ -45,8 +45,6 @@ from planner import (
     _invoke_with_transient_retry,
     build_chat_llm,
     create_search_plan,
-    fallback_search_plan,
-    set_planner_model,
     strip_schedule_phrases,
 )
 from scheduler import (
@@ -217,15 +215,14 @@ scheduled_llm_with_tools = llm.bind_tools(agent_tools)
 def set_chatbot_model(model: str) -> None:
     """Switch the active chat model at runtime.
 
-    Rebuilds the tool-bound LLM and the planner LLM, then reassigns the module
-    globals. The compiled graph reads these globals on every invocation, so
-    both interactive chat and scheduled runs pick up the new model immediately.
+    Rebuilds the tool-bound LLM and reassigns the module globals. The compiled
+    graph reads these globals on every invocation, so both interactive chat
+    and scheduled runs pick up the new model immediately.
     """
     global llm, llm_with_tools, scheduled_llm_with_tools
     llm = build_chat_llm(model)
     llm_with_tools = llm.bind_tools(agent_tools)
     scheduled_llm_with_tools = llm.bind_tools(agent_tools)
-    set_planner_model(model)
 
 
 def _message_text(message: BaseMessage) -> str:
@@ -616,11 +613,7 @@ def run_cli() -> None:
             if _handle_command(user_input):
                 continue
 
-            try:
-                plan = create_search_plan(user_input)
-            except Exception as exc:  # noqa: BLE001
-                console_print(f"Planner error: {exc}. Using local fallback.")
-                plan = fallback_search_plan(user_input)
+            plan = create_search_plan(user_input)
 
             start_msg = (
                 f"Planned search: {plan.search_query!r}; "

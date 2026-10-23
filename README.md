@@ -20,8 +20,8 @@ The scheduling engine was rewritten to fix the pain points of the original:
   longer aborts the schedule; each run is retried with exponential backoff.
 - **Absolute times** — natural-language prompts like *"search python news at 3pm"*,
   *"tomorrow 9am"*, or *"in 5 minutes"* are parsed and honored.
-- **Improved fallback planner** — recognises *hourly*, *daily*, *every day at X*,
-  *twice*, *thrice*, *in N minutes*.
+- **Local planner** — recognises *hourly*, *daily*, *every day at X*, *twice*,
+  *thrice*, *every N minutes*, and *in N minutes* with regexes, no extra LLM call.
 - **Separate embedding model** — `JINA_EMBEDDING_MODEL` keeps RAG aligned with
   Jina's free embedding API (`jina-embeddings-v4`, 1M free tokens/day); the
   chat LLM remains Gemini.
@@ -282,7 +282,7 @@ persistence, resume, pause, cancel, no-wait-after-final-run).
 streamlit_app.py      Primary UI — dark terminal-inspired chat (Streamlit)
 app.py                Legacy CLI + LangGraph wiring + tools (imported by streamlit_app)
 config.py             Centralised env parsing
-planner.py            Search + schedule planner (LLM + regex fallback + absolute time)
+planner.py            Search + schedule planner (regex + absolute time)
 scheduler.py          Job registry, persistence, retries, pause/resume
 tools_search.py       DuckDuckGo tool with retry / backoff
 ragtool.py            User-uploaded PDF indexing + retrieval

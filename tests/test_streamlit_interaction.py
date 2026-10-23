@@ -42,8 +42,7 @@ def fake_ai(monkeypatch, tmp_path):
     )
 
     import app
-    import planner
-    from planner import SearchPlan, create_search_plan
+    from planner import create_search_plan
     from scheduler import JobRegistry, Scheduler
 
     monkeypatch.setattr(
@@ -88,23 +87,9 @@ def fake_ai(monkeypatch, tmp_path):
         def invoke(self, messages):
             return AIMessage(content="Tesla market update")
 
-    class FakeSearchPlanner:
-        def __init__(self, plan):
-            self.plan = plan
-
-        def invoke(self, messages):
-            return self.plan
-
-    plan = SearchPlan(
-        search_query="tesla news",
-        should_schedule=False,
-        wait_minutes=0.0,
-        run_count=1,
-    )
     monkeypatch.setattr(app, "chatbot", FakeBot())
     monkeypatch.setattr(app, "llm", FakeLLM())
-    monkeypatch.setattr(planner, "search_planner", FakeSearchPlanner(plan))
-    return app, plan
+    return app
 
 
 def _launch(fixtures):
@@ -136,7 +121,7 @@ def test_send_prompt_streams_reply_with_usage_caption(fake_ai):
 
 
 def test_stream_failure_falls_back_and_shows_friendly_error(fake_ai):
-    fake_ai[0].chatbot.fail_stream = True
+    fake_ai.chatbot.fail_stream = True
     at = _launch(fake_ai)
     at.chat_input[0].set_value("hello")
     at.run()
@@ -158,7 +143,7 @@ def test_first_chat_gets_llm_title(fake_ai):
 def test_active_job_declares_poll_fragment_without_errors(fake_ai):
     """With a live job in the registry, the page must render and the poller
     fragment must be declared without raising."""
-    app, _ = fake_ai
+    app = fake_ai
     from scheduler import ScheduledSearchJob
 
     job = ScheduledSearchJob(prompt="track tesla", interval_minutes=1, run_count=5)

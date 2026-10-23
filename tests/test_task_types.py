@@ -99,25 +99,6 @@ def test_clamp_clears_reminder_text_for_non_reminder():
     assert clamped.reminder_text is None
 
 
-def test_llm_search_gets_regex_reminder_upgrade(monkeypatch):
-    """If the LLM misses the reminder intent and returns task_type='search',
-    the safety-net regex detection must upgrade the plan to 'reminder'."""
-    def fake_invoke(messages):
-        return planner.SearchPlan(
-            task_type="search",   # LLM missed it
-            search_query="drink water",
-            reminder_text=None,
-            should_schedule=True,
-            wait_minutes=5,
-            run_count=1,
-        )
-
-    monkeypatch.setattr(planner, "_invoke_search_planner", fake_invoke)
-    plan = planner.create_search_plan("remind me to drink water in 5 minutes")
-    assert plan.task_type == "reminder"
-    assert plan.reminder_text is not None
-
-
 # ---- Message builder dispatch ------------------------------------------------
 
 
