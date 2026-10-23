@@ -80,7 +80,6 @@ from planner import (
     SearchExecutionInstruction,
     SearchPlan,
     create_search_plan,
-    fallback_search_plan,
 )
 from scheduler import (
     ScheduleValidationError,
@@ -1382,17 +1381,8 @@ if prompt:
     with st.chat_message("user"):
         st.markdown(prompt)
 
-    # Plan the request (chooses schedule vs. one-off).
-    try:
-        plan = create_search_plan(prompt)
-    except Exception:  # noqa: BLE001
-        # The regex planner still honours explicit schedule phrases, so a
-        # transient LLM failure must not silently turn a recurring request
-        # into one immediate answer. Log only — the schedule-started message
-        # below is the user-facing confirmation, and a flashing warning would
-        # just look like a bug even when the fallback succeeded.
-        log.exception("Planner failed for prompt %r; using local fallback.", prompt)
-        plan = fallback_search_plan(prompt)
+    # Plan the request locally (schedule detection + task type).
+    plan = create_search_plan(prompt)
 
     with st.chat_message("assistant"):
         # Show planner summary as a subtle line above the answer.

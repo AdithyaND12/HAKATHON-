@@ -4,8 +4,6 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 
-import pytest
-
 import planner
 
 
@@ -77,87 +75,20 @@ def test_clamp_zero_out_wait_when_no_schedule():
     assert clamped.run_count == 1
 
 
-def test_trivial_prompt_still_uses_planner_llm(monkeypatch):
-    called = {"n": 0}
-
-    def fake_invoke(messages):
-        called["n"] += 1
-        return planner.SearchPlan(
-            search_query="2 + 2",
-            should_schedule=False,
-            wait_minutes=0,
-            run_count=1,
-        )
-
-    monkeypatch.setattr(planner, "_invoke_search_planner", fake_invoke)
-    plan = planner.create_search_plan("2 + 2")
-    assert called["n"] == 1
-    assert plan.run_count == 1
-    assert not plan.should_schedule
+def test_create_search_plan_parses_interval_and_count():
+    plan = planner.create_search_plan(
+        "can you search about car in internet for 2 times every 1 min"
+    )
+    assert plan.wait_minutes == 1.0
+    assert plan.run_count == 2
+    assert plan.should_schedule is True
 
 
-def test_llm_failure_falls_back_gracefully(monkeypatch):
-    def boom(messages):
-        raise RuntimeError("Gemini API unavailable")
-
-    monkeypatch.setattr(planner, "_invoke_search_planner", boom)
-    plan = planner.create_search_plan("check tesla stock every 5 minutes for 3 times")
-    assert plan.should_schedule
-    assert plan.wait_minutes == 5
-    assert plan.run_count == 3
-
-
-def test_planner_uses_function_calling_method_first():
-    assert planner._PLANNER_METHODS[0] == "function_calling"
-
-
-def test_planner_falls_over_to_next_method_on_response_format_error(monkeypatch):
-    """When a server rejects one structured-output method, planner tries the next."""
-    # Reset the module-level index so this test is deterministic.
-    monkeypatch.setattr(planner, "_current_planner_method_index", 0)
-
-    attempts = []
-
-    class FakePlanner:
-        def __init__(self, method):
-            self.method = method
-
-        def invoke(self, messages):
-            attempts.append(self.method)
-            if self.method == "function_calling":
-                raise RuntimeError(
-                    "Error code: 400 - {'error': \"response_format not supported for method\"}"
-                )
-            return planner.SearchPlan(
-                search_query="ok", should_schedule=False, wait_minutes=0, run_count=1
-            )
-
-    def fake_builder(method):
-        return FakePlanner(method)
-
-    monkeypatch.setattr(planner, "_build_search_planner", fake_builder)
-    monkeypatch.setattr(planner, "search_planner", fake_builder("function_calling"))
-
-    result = planner._invoke_search_planner([{"role": "user", "content": "hi"}])
-    assert result.search_query == "ok"
-    assert "function_calling" in attempts
-    assert "json_schema" in attempts
-    # Once failover happens, subsequent calls skip the broken method.
-    assert planner._current_planner_method_index >= 1
-
-
-def test_planner_non_format_error_propagates(monkeypatch):
-    """Errors unrelated to response_format must bubble up so the caller can fall back."""
-    monkeypatch.setattr(planner, "_current_planner_method_index", 0)
-
-    class ExplodingPlanner:
-        def invoke(self, messages):
-            raise RuntimeError("connection refused")
-
-    monkeypatch.setattr(planner, "search_planner", ExplodingPlanner())
-
-    with pytest.raises(RuntimeError, match="connection refused"):
-        planner._invoke_search_planner([{"role": "user", "content": "hi"}])
+def test_create_search_plan_hourly_twice():
+    plan = planner.create_search_plan("check news every hour twice")
+    assert plan.wait_minutes == 60.0
+    assert plan.run_count == 2
+    assert plan.should_schedule is True
 
 
 # ---- Regression tests for interval/time parsing bugs -------------------------
@@ -178,13 +109,13 @@ def test_long_intervals_are_not_capped_to_the_wait_tool_limit():
 
 
 def test_daily_fallback_keeps_24_hour_interval():
-    plan = planner.fallback_search_plan("check python news daily")
+    plan = planner.create_search_plan("check python news daily")
     assert plan.should_schedule
     assert plan.wait_minutes == 24 * 60
 
 
 def test_hourly_monitor_defaults_to_two_runs():
-    plan = planner.fallback_search_plan("monitor python news hourly")
+    plan = planner.create_search_plan("monitor python news hourly")
     assert plan.should_schedule
     assert plan.wait_minutes == 60
     assert plan.run_count == 2
@@ -205,7 +136,7 @@ def test_bare_number_after_tomorrow_is_not_a_clock_time():
 
 
 def test_duration_without_recurrence_is_not_scheduling():
-    plan = planner.fallback_search_plan("the movie is 90 minutes long")
+    plan = planner.create_search_plan("the movie is 90 minutes long")
     assert not plan.should_schedule
     assert plan.run_count == 1
     assert plan.wait_minutes == 0
@@ -218,41 +149,6 @@ def test_absolute_start_is_normalized_to_utc():
     naive = planner._normalize_absolute_start("2030-01-01T09:00:00")
     assert naive is not None and naive.endswith("+00:00")
     assert planner._normalize_absolute_start("tomorrow at 9") is None
-
-
-def test_literal_interval_and_count_override_llm_conversion(monkeypatch):
-    """The LLM sometimes converts "every 1 min" to 0.0167 (seconds). Literal
-    prompt values must win so the second run does not fire immediately."""
-    bad_plan = planner.SearchPlan(
-        search_query="car",
-        should_schedule=True,
-        wait_minutes=1 / 60,
-        run_count=1,
-    )
-    monkeypatch.setattr(planner, "_invoke_search_planner", lambda messages: bad_plan)
-
-    plan = planner.create_search_plan(
-        "can you search about car in internet for 2 times every 1 min"
-    )
-
-    assert plan.wait_minutes == 1.0
-    assert plan.run_count == 2
-    assert plan.should_schedule is True
-
-
-def test_literal_hourly_interval_overrides_llm(monkeypatch):
-    bad_plan = planner.SearchPlan(
-        search_query="news",
-        should_schedule=True,
-        wait_minutes=0.0167,
-        run_count=1,
-    )
-    monkeypatch.setattr(planner, "_invoke_search_planner", lambda messages: bad_plan)
-
-    plan = planner.create_search_plan("check news every hour twice")
-
-    assert plan.wait_minutes == 60.0
-    assert plan.should_schedule is True
 
 
 def test_chat_llm_uses_dedicated_timeout_and_retries():
