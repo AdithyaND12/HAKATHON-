@@ -35,8 +35,8 @@ The scheduling engine was rewritten to fix the pain points of the original:
 - Web search via DuckDuckGo (wrapped with retry + backoff).
 - Calculator and current-time tools.
 - Alpha Vantage stock-price lookup with structured error taxonomy.
-- Uploaded-PDF RAG using PyMuPDF, OCR fallback, heading-aware chunking,
-  contextual retrieval, Gemini embeddings, and Chroma — no built-in
+- Uploaded-PDF RAG using PyMuPDF, OCR fallback, plain chunking, Gemini
+  embeddings, lightweight reranking, and Chroma — no built-in
   document; the user uploads the PDF.
 - Natural-language scheduling: *"check tesla news every 10 minutes for 5 times"*,
   *"search AI news at 3pm"*, *"monitor python news hourly"*.
@@ -231,17 +231,10 @@ embeddings too; the model defaults to `gemini-embedding-001`.
 
 - **Text extraction** — PyMuPDF pulls the native text layer; scanned
   (image-only) pages fall back to tesseract OCR at 200 dpi.
-- **Heading-aware extraction** — font-size and bold heuristics detect section
-  headings on every page, so the chunker can keep the document outline intact.
-- **Section-aware chunking** — a recursive text splitter (500 chars, 50
-  overlap) records both the leaf `heading` and the full `heading_path`
-  (e.g. `Methods > Statistical Analysis`) on every chunk, improving retrieval
-  for questions about named sections and giving the model precise citations.
-- **Contextual retrieval** — chunks are embedded with a `[document > section]`
-  prefix so semantically related passages that share no words still co-locate;
-  the raw passage is kept in metadata so answers quote clean, readable text.
-- **Vector retrieval** — Gemini embeddings plus MMR return the `k` most
-  relevant passages while filtering out near-duplicate chunks.
+- **Chunking** — a recursive text splitter creates plain 500-character
+  chunks with 50-character overlap.
+- **Retrieval and reranking** — Gemini embeddings retrieve candidates, then a
+  lightweight query-term reranker selects the final `k` passages.
 
 ### Robustness and freshness
 
@@ -249,7 +242,7 @@ embeddings too; the model defaults to `gemini-embedding-001`.
   its sha256; re-indexing an unchanged file is skipped entirely.
 - **Stale-index invalidation** — every collection is stamped with an index
   marker (embedding model + pipeline version + PDF hash). Switching the
-  embedding model or changing the chunking/contextualization logic
+  embedding model or changing the chunking logic
   automatically wipes and rebuilds incompatible stores instead of silently
   serving stale vectors.
 - **Embedding resilience** — batches (default 32 chunks per request) retry

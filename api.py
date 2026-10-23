@@ -201,8 +201,9 @@ async def get_job_logs(job_id: str):
 
 @app.get("/documents")
 async def list_documents():
-    """List all indexed PDF documents in RAG."""
-    return ragtool.list_indexed_documents()
+    """Return the one indexed PDF, if one exists."""
+    meta = ragtool.document_metadata()
+    return [meta] if meta else []
 
 MAX_UPLOAD_BYTES = 50 * 1024 * 1024
 
@@ -251,18 +252,13 @@ async def upload_document(file: UploadFile = File(...)):
             detail=f"Indexing failed: {exc}",
         )
 
-    collection_name = ragtool.collection_name_for_sha(sha)
-    ragtool.set_active_collection(collection_name)
-
     return {
         "message": f"Successfully indexed {filename}",
         "chunks": count,
-        "collection_name": collection_name,
+        "collection_name": ragtool.COLLECTION_NAME,
     }
 
 @app.post("/documents/active")
 async def set_active_document(request: ActiveDocumentRequest):
-    """Select or clear the active RAG document collection."""
-    ragtool.set_active_collection(request.collection_name)
-    return {"message": f"Active collection set to {request.collection_name}"}
-
+    """Keep the single indexed PDF as the active document."""
+    return {"message": f"Active document is {ragtool.COLLECTION_NAME}"}
