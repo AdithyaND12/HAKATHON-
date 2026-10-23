@@ -1,7 +1,7 @@
 """Tests for the improved scheduler.
 
 These tests exercise the registry, persistence, retries, and pause/resume
-without depending on any LLM, LM Studio, or network calls.
+without depending on any LLM or network calls.
 """
 
 from __future__ import annotations

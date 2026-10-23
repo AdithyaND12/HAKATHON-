@@ -116,16 +116,14 @@ def streamlit_secret(name: str) -> str:
 
 # ---- Public config ------------------------------------------------------------
 
-_legacy_lm_studio_model = env_str("LM_STUDIO_MODEL", "")
-_legacy_lm_studio_api_key = env_str("LM_STUDIO_API_KEY", "")
-
-_configured_model = env_str("GEMINI_MODEL", _legacy_lm_studio_model or DEFAULT_GEMINI_MODEL)
+_configured_model = env_str("GEMINI_MODEL", DEFAULT_GEMINI_MODEL)
 GEMINI_MODEL = _RETIRED_GEMINI_MODELS.get(_configured_model, _configured_model)
 
 # A single Gemini key powers both chat and PDF embeddings. In the Streamlit
 # UI the user can enter their own key at runtime via `set_gemini_api_key`.
 GEMINI_API_KEY = (
-    env_str("GEMINI_API_KEY", env_str("GOOGLE_API_KEY", _legacy_lm_studio_api_key))
+    env_str("GEMINI_API_KEY")
+    or env_str("GOOGLE_API_KEY")
     or streamlit_secret("GEMINI_API_KEY")
     or streamlit_secret("GOOGLE_API_KEY")
 )
@@ -137,14 +135,9 @@ def set_gemini_api_key(api_key: str) -> None:
     Used by the Streamlit UI when a user pastes their own key. Environment
     values are still the fallback for CLI/API deployments.
     """
-    global GEMINI_API_KEY, LM_STUDIO_API_KEY
+    global GEMINI_API_KEY
     GEMINI_API_KEY = (api_key or "").strip()
-    LM_STUDIO_API_KEY = GEMINI_API_KEY
 
-# Backward-compatible aliases for older imports.
-LM_STUDIO_MODEL = GEMINI_MODEL
-LM_STUDIO_API_KEY = GEMINI_API_KEY
-LM_STUDIO_BASE_URL = "Gemini API"
 ALPHAVANTAGE_API_KEY = env_str("ALPHAVANTAGE_API_KEY") or streamlit_secret(
     "ALPHAVANTAGE_API_KEY"
 )

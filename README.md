@@ -57,6 +57,9 @@ The scheduling engine was rewritten to fix the pain points of the original:
   their own key in the Streamlit sidebar; it does not belong in `.env`.
 - An Alpha Vantage API key if stock-price lookups are required.
 
+The app is Gemini-only: local providers such as LM Studio and other
+OpenAI-compatible servers are not supported.
+
 ## Installation
 
 ```bash
