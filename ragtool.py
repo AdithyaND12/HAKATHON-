@@ -23,10 +23,8 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
-import math
 import re
 import time
-from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, Optional
@@ -347,7 +345,6 @@ def _rebuild_store() -> None:
     persist_dir = _persist_dir()
     log.warning("Resetting Chroma store %s and rebuilding from scratch.", persist_dir)
     _get_client().reset()
-    _BM25_CACHE.clear()
 
 
 def _add_documents_with_retries(vectorstore: Chroma, documents: list[Document]) -> None:
@@ -409,238 +406,22 @@ def _format_results(results: list[Document]) -> str:
     return "\n\n".join(parts)
 
 
-# Fetch this many candidates over `k` for MMR diversity, since the top-k
-# cosine hits are often near-duplicate passages of one paragraph.
-MMR_FETCH_MULTIPLIER = 5
-
-# ---- Hybrid retrieval: BM25 + vector -----------------------------------------
-
-BM25_K1 = 1.5
-BM25_B = 0.75
-RRF_K = 60
-BM25_SIDECAR_VERSION = 1
-BM25_STOPWORDS = frozenset(
-    "a an and are as at be but by for from has have in is it its of on or that "
-    "the their this to was were will with".split()
-)
-_BM25_TOKEN_RE = re.compile(r"[a-z0-9]+")
-_BM25_CACHE: dict[str, tuple[int, list[dict], "_BM25Index"]] = {}
-
-
-def _bm25_tokenize(text: str) -> list[str]:
-    return [
-        token
-        for token in _BM25_TOKEN_RE.findall(text.lower())
-        if len(token) > 1 and token not in BM25_STOPWORDS
-    ]
-
-
-def _chunk_key(raw_text: str, page: object) -> str:
-    return hashlib.sha1(f"{page}|{raw_text}".encode("utf-8")).hexdigest()
-
-
-def _document_key(document: Document) -> str:
-    return _chunk_key(
-        document.metadata.get("raw_text") or document.page_content,
-        document.metadata.get("page"),
-    )
-
-
-class _BM25Index:
-    """Dependency-free BM25 ranking over chunk texts."""
-
-    def __init__(self, entries: list[dict]):
-        self._term_freqs = []
-        lengths = []
-        for entry in entries:
-            tokens = _bm25_tokenize(entry.get("raw_text") or "")
-            self._term_freqs.append(Counter(tokens))
-            lengths.append(len(tokens))
-        self._lengths = lengths
-        count = len(entries)
-        self._avg_length = (sum(lengths) / count) if count else 0.0
-        document_freq: Counter[str] = Counter()
-        for freqs in self._term_freqs:
-            document_freq.update(freqs.keys())
-        self._idf = {
-            term: math.log(1 + (count - freq + 0.5) / (freq + 0.5))
-            for term, freq in document_freq.items()
-        }
-
-    def search(self, query: str, limit: int) -> list[int]:
-        terms = _bm25_tokenize(query)
-        if not terms or not self._term_freqs:
-            return []
-        scored: list[tuple[float, int]] = []
-        for index, freqs in enumerate(self._term_freqs):
-            length = self._lengths[index]
-            norm = BM25_K1 * (
-                1 - BM25_B + BM25_B * (length / self._avg_length if self._avg_length else 1)
-            )
-            score = 0.0
-            for term in terms:
-                term_freq = freqs.get(term)
-                if not term_freq:
-                    continue
-                score += self._idf.get(term, 0.0) * (
-                    term_freq * (BM25_K1 + 1) / (term_freq + norm)
-                )
-            if score > 0:
-                scored.append((score, index))
-        scored.sort(key=lambda item: item[0], reverse=True)
-        return [index for _, index in scored[:limit]]
-
-
-def _bm25_sidecar_path(collection_name: str) -> Path:
-    return _persist_dir() / f".bm25_{collection_name}.json"
-
-
-def _bm25_cache_key(collection_name: str) -> str:
-    return f"{_persist_dir()}:{collection_name}"
-
-
-def _bm25_entries_from_chunks(chunks: list[Document]) -> list[dict]:
-    entries = []
-    for chunk in chunks:
-        raw_text = chunk.metadata.get("raw_text") or chunk.page_content
-        entries.append(
-            {
-                "key": _chunk_key(raw_text, chunk.metadata.get("page")),
-                "raw_text": raw_text,
-                "page": chunk.metadata.get("page"),
-                "heading_path": chunk.metadata.get("heading_path"),
-                "source": chunk.metadata.get("source"),
-            }
-        )
-    return entries
-
-
-def _write_bm25_sidecar(collection_name: str, chunks: list[Document]) -> None:
-    """Persist chunk text for keyword search next to the vector collection."""
-    try:
-        _persist_dir().mkdir(parents=True, exist_ok=True)
-        _bm25_sidecar_path(collection_name).write_text(
-            json.dumps(
-                {
-                    "version": BM25_SIDECAR_VERSION,
-                    "collection": collection_name,
-                    "entries": _bm25_entries_from_chunks(chunks),
-                }
-            ),
-            encoding="utf-8",
-        )
-    except OSError:
-        log.warning("Could not write BM25 sidecar for %s", collection_name)
-        return
-    _BM25_CACHE.pop(_bm25_cache_key(collection_name), None)
-
-
-def _load_bm25_entries(
-    collection_name: str, vectorstore: Chroma
-) -> Optional[list[dict]]:
-    path = _bm25_sidecar_path(collection_name)
-    if path.is_file():
-        try:
-            payload = json.loads(path.read_text(encoding="utf-8"))
-            entries = payload.get("entries")
-            if payload.get("version") == BM25_SIDECAR_VERSION and isinstance(entries, list):
-                return entries or None
-        except (OSError, ValueError):
-            log.warning("Ignoring unreadable BM25 sidecar for %s", collection_name)
-
-    # Indexes created before hybrid search have no sidecar: rebuild keywords
-    # from the vector store's stored metadata instead of re-embedding.
-    try:
-        raw = vectorstore._collection.get(include=["documents", "metadatas"])  # noqa: SLF001
-    except Exception:  # noqa: BLE001 - hybrid search is optional
-        return None
-    entries = []
-    for text, metadata in zip(raw.get("documents") or [], raw.get("metadatas") or []):
-        metadata = metadata or {}
-        raw_text = metadata.get("raw_text") or text or ""
-        entries.append(
-            {
-                "key": _chunk_key(raw_text, metadata.get("page")),
-                "raw_text": raw_text,
-                "page": metadata.get("page"),
-                "heading_path": metadata.get("heading_path"),
-                "source": metadata.get("source"),
-            }
-        )
-    return entries or None
-
-
-def _bm25_index_for(
-    collection_name: str, vectorstore: Chroma
-) -> tuple[Optional[list[dict]], Optional["_BM25Index"]]:
-    entries = _load_bm25_entries(collection_name, vectorstore)
-    if not entries:
-        return None, None
-    cache_key = _bm25_cache_key(collection_name)
-    cached = _BM25_CACHE.get(cache_key)
-    if cached and cached[0] == len(entries):
-        return cached[1], cached[2]
-    index = _BM25Index(entries)
-    _BM25_CACHE[cache_key] = (len(entries), entries, index)
-    return entries, index
-
-
-def _reciprocal_rank_fusion(rankings: list[list[str]], limit: int) -> list[str]:
-    scores: dict[str, float] = {}
-    for ranking in rankings:
-        for position, key in enumerate(ranking, start=1):
-            scores[key] = scores.get(key, 0.0) + 1.0 / (RRF_K + position)
-    return [
-        key
-        for key, _ in sorted(scores.items(), key=lambda item: item[1], reverse=True)[
-            :limit
-        ]
-    ]
+# Fetch extra candidates so MMR can pick diverse passages instead of
+# near-duplicate chunks from the same paragraph.
+MMR_FETCH_MULTIPLIER = 4
 
 
 def _retrieve_once(query: str, collection_name: str, k: int) -> str:
-    """Hybrid retrieval: vector search + BM25, fused with RRF.
-
-    The vector arm keeps MMR diversity over a wider candidate set; BM25 adds
-    exact keyword/name/number matching that embeddings often miss. RRF merges
-    both rankings before the final `k` passages are returned.
-    """
+    """Return the k most relevant, non-duplicate passages from a collection."""
     vectorstore = _get_vectorstore(collection_name)
-    candidate_k = max(k * MMR_FETCH_MULTIPLIER, k)
+    fetch_k = max(k * MMR_FETCH_MULTIPLIER, k)
     try:
-        vector_docs = vectorstore.max_marginal_relevance_search(
-            query, k=candidate_k, fetch_k=candidate_k * 2
+        documents = vectorstore.max_marginal_relevance_search(
+            query, k=k, fetch_k=fetch_k
         )
     except AttributeError:  # pragma: no cover - langchain_chroma has MMR
-        vector_docs = vectorstore.similarity_search(query, k=candidate_k)
-
-    by_key: dict[str, Document] = {_document_key(doc): doc for doc in vector_docs}
-    rankings = [[_document_key(doc) for doc in vector_docs]]
-
-    entries, bm25 = _bm25_index_for(collection_name, vectorstore)
-    if entries and bm25 is not None:
-        keyword_hits = bm25.search(query, limit=candidate_k)
-        rankings.append([entries[index]["key"] for index in keyword_hits])
-        for index in keyword_hits:
-            entry = entries[index]
-            key = entry["key"]
-            if key in by_key:
-                continue
-            by_key[key] = Document(
-                page_content=entry.get("raw_text") or "",
-                metadata={
-                    "page": entry.get("page"),
-                    "heading_path": entry.get("heading_path"),
-                    "source": entry.get("source"),
-                    "raw_text": entry.get("raw_text") or "",
-                },
-            )
-
-    fused_keys = _reciprocal_rank_fusion(rankings, limit=candidate_k)
-    documents = [by_key[key] for key in fused_keys if key in by_key]
-    if not documents:
-        documents = vector_docs
-    return _format_results(documents[:k])
+        documents = vectorstore.similarity_search(query, k=k)
+    return _format_results(documents)
 
 
 def _reindex_collection(collection_name: str) -> bool:
@@ -766,7 +547,6 @@ def _prepare_collection(vectorstore: Chroma, collection_name: str) -> Chroma:
         vectorstore.delete_collection()
     except Exception:  # noqa: BLE001 - collection may not exist yet
         pass
-    _BM25_CACHE.pop(_bm25_cache_key(collection_name), None)
     return _get_vectorstore(collection_name)
 
 
@@ -798,7 +578,6 @@ def index_pdf(
     chunks = _split_documents(pages)
     vectorstore = _get_vectorstore(collection_name)
     if _collection_is_current(vectorstore, collection_name, sha, len(chunks)):
-        _write_bm25_sidecar(collection_name, chunks)
         return len(chunks)
 
     try:
@@ -842,7 +621,6 @@ def index_pdf(
         ),
         encoding="utf-8",
     )
-    _write_bm25_sidecar(collection_name, chunks)
     return total
 
 
@@ -930,11 +708,9 @@ def remove_indexed_document(collection_name: str) -> None:
         _get_vectorstore(collection_name).delete_collection()
     except Exception:  # noqa: BLE001
         log.warning("Could not delete collection %s", collection_name)
-    _BM25_CACHE.pop(_bm25_cache_key(collection_name), None)
     for path in (
         _collection_marker_path(collection_name),
         _collection_meta_path(collection_name),
-        _bm25_sidecar_path(collection_name),
     ):
         try:
             path.unlink(missing_ok=True)

@@ -240,11 +240,8 @@ embeddings too; the model defaults to `gemini-embedding-001`.
 - **Contextual retrieval** — chunks are embedded with a `[document > section]`
   prefix so semantically related passages that share no words still co-locate;
   the raw passage is kept in metadata so answers quote clean, readable text.
-- **Hybrid retrieval** — the vector arm (MMR over `5 × k` candidates) is fused
-  with a BM25 keyword index over the same chunks via Reciprocal Rank Fusion,
-  so exact names, numbers, and section terms are not lost to embedding drift.
-  BM25 data is stored in a `.bm25_<collection>.json` sidecar; older indexes
-  rebuild it from stored metadata on first query.
+- **Vector retrieval** — Gemini embeddings plus MMR return the `k` most
+  relevant passages while filtering out near-duplicate chunks.
 
 ### Robustness and freshness
 

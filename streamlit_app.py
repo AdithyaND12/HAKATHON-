@@ -1155,7 +1155,7 @@ with st.sidebar:
 
         if st.session_state.get("rag_mode", True):
             st.caption(f"embedding model: `{ragtool.get_embedding_model_name()}` (Gemini)")
-            st.caption("retrieval: BM25 + vector")
+            st.caption("retrieval: vector search (MMR)")
         else:
             st.caption("embedding: off (raw mode)")
     else:

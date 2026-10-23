@@ -117,7 +117,7 @@ def test_retrieve_self_heals_corrupt_collection(monkeypatch, tmp_path):
     assert "recovered chunk" in out
 
 
-def test_index_pdf_builds_collection_and_writes_sidecar(monkeypatch, tmp_path):
+def test_index_pdf_builds_collection_and_metadata(monkeypatch, tmp_path):
     pdf = tmp_path / "doc.pdf"
     pdf.write_bytes(b"%PDF-1.7\nfake bytes\n")
     sha = ragtool._pdf_hash(pdf)
@@ -147,11 +147,6 @@ def test_index_pdf_builds_collection_and_writes_sidecar(monkeypatch, tmp_path):
     assert meta["chunks"] == 1
     assert meta["embedding_model"] == ragtool.GOOGLE_EMBEDDING_MODEL
     assert (tmp_path / f".marker_{collection}").read_text(encoding="utf-8") == ragtool._expected_marker(sha)
-    bm25 = json.loads(
-        (tmp_path / f".bm25_{collection}.json").read_text(encoding="utf-8")
-    )
-    assert bm25["version"] == ragtool.BM25_SIDECAR_VERSION
-    assert bm25["entries"][0]["raw_text"] == "hello document text"
 
 
 def test_index_pdf_skips_reindexing_when_unchanged(monkeypatch, tmp_path):
@@ -411,7 +406,7 @@ def test_retrieve_once_uses_mmr_for_diversity(monkeypatch, tmp_path):
 
     out = ragtool._retrieve_once("speech", "rag_abc", 4)
 
-    assert store.calls == [("speech", 20, 40)]
+    assert store.calls == [("speech", 4, 16)]
     assert "chunk a" in out
 
 
@@ -508,71 +503,3 @@ def test_selecting_raw_document_clears_indexed(monkeypatch, tmp_path):
     ragtool.set_active_raw("raw_fresh")
 
     assert ragtool._ACTIVE_COLLECTION is None
-
-
-# ---- Hybrid retrieval: BM25 + RRF ---------------------------------------------
-
-
-def test_bm25_prefers_exact_keyword_matches():
-    entries = [
-        {"raw_text": "the cat sat on the mat"},
-        {"raw_text": "article 21 protects life and personal liberty"},
-        {"raw_text": "random text about the weather"},
-    ]
-
-    hits = ragtool._BM25Index(entries).search("article 21", limit=3)
-
-    assert hits and hits[0] == 1
-
-
-def test_rrf_rewards_agreement_between_arms():
-    fused = ragtool._reciprocal_rank_fusion(
-        [["a", "b", "c"], ["c", "a"]], limit=2
-    )
-
-    assert fused == ["a", "c"]
-
-
-def test_hybrid_retrieval_adds_bm25_only_hits(monkeypatch, tmp_path):
-    class _Store:
-        def max_marginal_relevance_search(self, query, k=4, fetch_k=20):
-            return [Document(page_content="unrelated chunk", metadata={"page": 0})]
-
-    monkeypatch.setattr(ragtool, "_get_vectorstore", lambda name: _Store())
-    monkeypatch.setattr(ragtool, "PERSIST_DIRECTORY", tmp_path)
-    ragtool._write_bm25_sidecar(
-        "rag_kw",
-        [
-            Document(
-                page_content="Article 21 protects personal liberty",
-                metadata={"page": 4},
-            )
-        ],
-    )
-
-    out = ragtool._retrieve_once("article 21", "rag_kw", 2)
-
-    assert "Article 21 protects personal liberty" in out
-
-
-def test_bm25_rebuilds_from_vector_store_without_sidecar(monkeypatch, tmp_path):
-    class _Collection:
-        def get(self, include=None):
-            return {
-                "documents": ["Article 21 protects liberty", "unrelated text"],
-                "metadatas": [{"page": 4}, {"page": 5}],
-            }
-
-    class _Store:
-        def __init__(self):
-            self._collection = _Collection()
-
-        def max_marginal_relevance_search(self, query, k=4, fetch_k=20):
-            return [Document(page_content="unrelated text", metadata={"page": 5})]
-
-    monkeypatch.setattr(ragtool, "_get_vectorstore", lambda name: _Store())
-    monkeypatch.setattr(ragtool, "PERSIST_DIRECTORY", tmp_path)
-
-    out = ragtool._retrieve_once("article 21 liberty", "rag_nosidecar", 2)
-
-    assert "Article 21 protects liberty" in out
